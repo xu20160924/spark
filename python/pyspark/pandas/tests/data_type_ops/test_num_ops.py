@@ -102,7 +102,8 @@ class NumOpsTestsMixin:
         pdf, psdf = self.pdf, self.psdf
         for col in self.numeric_df_cols:
             pser, psser = pdf[col], psdf[col]
-            self.assert_eq(pser, psser._to_pandas(), check_exact=False)
+            ignore_null = self.ignore_null(col)
+            self.assert_eq(pser, psser._to_pandas(), check_exact=False, ignore_null=ignore_null)
             self.assert_eq(ps.from_pandas(pser), psser)
 
     def test_isnull(self):
@@ -113,12 +114,16 @@ class NumOpsTestsMixin:
     def test_neg(self):
         pdf, psdf = self.pdf, self.psdf
         for col in self.numeric_df_cols:
-            self.assert_eq(-pdf[col], -psdf[col], check_exact=False)
+            ignore_null = self.ignore_null(col)
+            self.assert_eq(-pdf[col], -psdf[col], check_exact=False, ignore_null=ignore_null)
 
     def test_abs(self):
         pdf, psdf = self.pdf, self.psdf
         for col in self.numeric_df_cols:
-            self.assert_eq(abs(pdf[col]), abs(psdf[col]), check_exact=False)
+            ignore_null = self.ignore_null(col)
+            self.assert_eq(
+                abs(pdf[col]), abs(psdf[col]), check_exact=False, ignore_null=ignore_null
+            )
 
     def test_invert(self):
         pdf, psdf = self.pdf, self.psdf
@@ -436,12 +441,6 @@ class NumOpsTests(
 
 
 if __name__ == "__main__":
-    from pyspark.pandas.tests.data_type_ops.test_num_ops import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()
