@@ -186,7 +186,7 @@
     <fasterxml.jackson.version>2.21.0</fasterxml.jackson.version>
     <ws.xmlschema.version>2.3.1</ws.xmlschema.version>
     <snappy.version>1.1.10.8</snappy.version>
-    <netlib.ludovic.dev.version>3.0.4</netlib.ludovic.dev.version>
+    <netlib.ludovic.dev.version>3.1.1</netlib.ludovic.dev.version>
     <commons-codec.version>1.21.0</commons-codec.version>
     <commons-compress.version>1.28.0</commons-compress.version>
     <commons-io.version>2.21.0</commons-io.version>
@@ -339,7 +339,7 @@
     </extraJavaTestArgs>
     <mariadb.java.client.version>3.5.7</mariadb.java.client.version>
     <mysql.connector.version>9.6.0</mysql.connector.version>
-    <postgresql.version>42.7.7</postgresql.version>
+    <postgresql.version>42.7.10</postgresql.version>
     <db2.jcc.version>11.5.9.0</db2.jcc.version>
     <mssql.jdbc.version>13.2.1.jre11</mssql.jdbc.version>
     <ojdbc17.version>23.6.0.24.10</ojdbc17.version>
@@ -373,17 +373,6 @@
       <id>central</id>
       <name>Maven Repository</name>
       <url>https://repo.maven.apache.org/maven2</url>
-      <releases>
-        <enabled>true</enabled>
-      </releases>
-      <snapshots>
-        <enabled>false</enabled>
-      </snapshots>
-    </repository>
-    <repository>
-      <id>jitpack.io</id>
-      <name>JitPack</name>
-      <url>https://jitpack.io</url>
       <releases>
         <enabled>true</enabled>
       </releases>
@@ -930,9 +919,9 @@
         <scope>provided</scope>
       </dependency>
       <dependency>
-        <groupId>com.github.RoaringBitmap.RoaringBitmap</groupId>
-        <artifactId>roaringbitmap</artifactId>
-        <version>1.6.0</version>
+        <groupId>org.roaringbitmap</groupId>
+        <artifactId>RoaringBitmap</artifactId>
+        <version>1.6.10</version>
       </dependency>
       <!-- Netty Begin -->
       <dependency>
