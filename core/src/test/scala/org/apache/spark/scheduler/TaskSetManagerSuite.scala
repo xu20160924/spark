@@ -1573,8 +1573,7 @@ class TaskSetManagerSuite
   }
 
   test("SPARK-21563 context's added jars shouldn't change mid-TaskSet") {
-    val jarPath = Thread.currentThread().getContextClassLoader.getResource("TestUDTF.jar")
-    assume(jarPath != null)
+    val jarPath = TestUtils.createJarWithClasses(Seq("TaskSetManagerSuite_SPARK21563"))
     sc = new SparkContext("local", "test")
     val addedJarsPreTaskSet = Map[String, Long](sc.allAddedJars.toSeq: _*)
     assert(addedJarsPreTaskSet.size === 0)
@@ -1743,6 +1742,114 @@ class TaskSetManagerSuite
     // Make sure that task with index 2 is re-submitted
     assert(resubmittedTasks.contains(2))
 
+  }
+
+  test("SPARK-56235 Reverse index is correctly maintained and used by executorLost") {
+    sc = new SparkContext("local", "test")
+    sched = new FakeTaskScheduler(sc, ("exec1", "host1"), ("exec2", "host2"))
+    // Create a task set with 4 tasks
+    val taskSet = FakeTask.createTaskSet(4,
+      Seq(TaskLocation("host1", "exec1")),
+      Seq(TaskLocation("host1", "exec1")),
+      Seq(TaskLocation("host2", "exec2")),
+      Seq(TaskLocation("host2", "exec2")))
+    val clock = new ManualClock()
+    clock.advance(1)
+    val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES, clock = clock)
+
+    // Initially, the reverse index should be empty
+    assert(manager.executorIdToTaskIds.isEmpty)
+
+    // Offer resources: tasks 0, 1 on exec1; tasks 2, 3 on exec2
+    val task0 = manager.resourceOffer("exec1", "host1", PROCESS_LOCAL)._1.get
+    val task1 = manager.resourceOffer("exec1", "host1", PROCESS_LOCAL)._1.get
+    val task2 = manager.resourceOffer("exec2", "host2", PROCESS_LOCAL)._1.get
+    val task3 = manager.resourceOffer("exec2", "host2", PROCESS_LOCAL)._1.get
+
+    // Verify reverse index is correctly populated
+    assert(manager.executorIdToTaskIds.size === 2)
+    assert(manager.executorIdToTaskIds("exec1").size === 2)
+    assert(manager.executorIdToTaskIds("exec1").contains(task0.taskId))
+    assert(manager.executorIdToTaskIds("exec1").contains(task1.taskId))
+    assert(manager.executorIdToTaskIds("exec2").size === 2)
+    assert(manager.executorIdToTaskIds("exec2").contains(task2.taskId))
+    assert(manager.executorIdToTaskIds("exec2").contains(task3.taskId))
+
+    assert(manager.runningTasks === 4)
+
+    // Lose exec1 - only tasks on exec1 should be affected
+    sched.removeExecutor("exec1")
+    manager.executorLost("exec1", "host1", ExecutorProcessLost())
+
+    // Tasks on exec1 should be failed (no longer running)
+    assert(manager.runningTasks === 2)
+    // Tasks on exec2 should still be running
+    assert(manager.taskInfos(task2.taskId).running)
+    assert(manager.taskInfos(task3.taskId).running)
+    // Tasks on exec1 should not be running
+    assert(!manager.taskInfos(task0.taskId).running)
+    assert(!manager.taskInfos(task1.taskId).running)
+  }
+
+  test("SPARK-56235 Reverse index works correctly with speculative tasks") {
+    val conf = new SparkConf().set(config.SPECULATION_ENABLED, true)
+    sc = new SparkContext("local", "test", conf)
+    sc.conf.set(config.SPECULATION_MULTIPLIER, 0.0)
+    sc.conf.set(config.SPECULATION_QUANTILE, 0.5)
+
+    sched = new FakeTaskScheduler(sc, ("exec1", "host1"),
+      ("exec2", "host2"), ("exec3", "host3"))
+    sched.initialize(new FakeSchedulerBackend() {
+      override def killTask(
+          taskId: Long,
+          executorId: String,
+          interruptThread: Boolean,
+          reason: String): Unit = {}
+    })
+
+    val taskSet = FakeTask.createTaskSet(2,
+      Seq(TaskLocation("host1", "exec1")),
+      Seq(TaskLocation("host2", "exec2")))
+    val clock = new ManualClock()
+    val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES, clock = clock)
+
+    // Launch tasks: task 0 on exec1, task 1 on exec2
+    val task0 = manager.resourceOffer("exec1", "host1", PROCESS_LOCAL)._1.get
+    val task1 = manager.resourceOffer("exec2", "host2", PROCESS_LOCAL)._1.get
+
+    assert(manager.executorIdToTaskIds("exec1").size === 1)
+    assert(manager.executorIdToTaskIds("exec1").contains(task0.taskId))
+    assert(manager.executorIdToTaskIds("exec2").size === 1)
+    assert(manager.executorIdToTaskIds("exec2").contains(task1.taskId))
+
+    // Complete task 0, so that speculative task can be launched for task 1
+    clock.advance(1)
+    val directTaskResult = new DirectTaskResult[String]() {
+      override def value(resultSer: SerializerInstance): String = ""
+    }
+    manager.handleSuccessfulTask(task0.taskId, directTaskResult)
+
+    // Launch speculative copy of task 1 on exec3
+    clock.advance(1)
+    manager.checkSpeculatableTasks(0)
+    manager.speculatableTasks += 1
+    manager.addPendingTask(1, speculatable = true)
+    val specTask = manager.resourceOffer("exec3", "host3", ANY)._1.get
+    assert(specTask.index === 1)
+    assert(specTask.attemptNumber === 1)
+
+    // Verify reverse index now has speculative task on exec3
+    assert(manager.executorIdToTaskIds("exec3").size === 1)
+    assert(manager.executorIdToTaskIds("exec3").contains(specTask.taskId))
+
+    // Lose exec2 (where original task 1 is running)
+    sched.removeExecutor("exec2")
+    manager.executorLost("exec2", "host2", ExecutorProcessLost())
+
+    // Original task 1 should be failed, speculative task 1 on exec3 should still be running
+    assert(!manager.taskInfos(task1.taskId).running)
+    assert(manager.taskInfos(specTask.taskId).running)
+    assert(manager.runningTasks === 1)
   }
 
   private def createTaskResult(
@@ -2757,6 +2864,186 @@ class TaskSetManagerSuite
       healthTracker = Some(new HealthTracker(sc, None)))
     assert(taskSetManager.taskSetExcludelistHelperOpt.isDefined)
     assert(taskSetManager.taskSetExcludelistHelperOpt.get.isDryRun)
+  }
+
+  test("SPARK-56326: Streaming query Id and batch Id are included in scheduling log " +
+    "messages") {
+    sc = new SparkContext("local", "test")
+    val clock = new ManualClock
+    sched = new FakeTaskScheduler(sc, clock, ("exec1", "host1"))
+    val testQueryId = "test-query-id-1234"
+    val testBatchId = "42"
+    // Create a TaskSet with a non-null Properties containing the streaming metadata.
+    val properties = new Properties()
+    properties.setProperty(StructuredStreamingIdAwareSchedulerLogging.QUERY_ID_KEY, testQueryId)
+    properties.setProperty(StructuredStreamingIdAwareSchedulerLogging.BATCH_ID_KEY, testBatchId)
+    val taskSet = new TaskSet(Array(new FakeTask(0, 0, Nil)),
+    0, 0, 0, properties, ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID, None)
+
+    val logAppender = new LogAppender("streaming scheduling logs", maxEvents = 1000)
+    val loggerName = classOf[TaskSetManager].getName
+
+    withLogAppender(logAppender, loggerNames = Seq(loggerName)) {
+      // uses TaskSchedulerImpl.streamingTaskSetManager to ensure
+      // logging and properties is initialized correctly
+      val manager = sched.createTaskSetManager(taskSet, MAX_TASK_FAILURES)
+
+      // resourceOffer triggers prepareLaunchingTask which logs "Starting ..."
+      val taskOption = manager.resourceOffer("exec1", "host1", NO_PREF)._1
+      assert(taskOption.isDefined)
+
+      clock.advance(1)
+      // handleSuccessfulTask logs "Finished ..."
+      manager.handleSuccessfulTask(0, createTaskResult(0))
+    }
+
+    val logs = logAppender.loggingEvents.map(_.getMessage.getFormattedMessage)
+
+    // default queryIdLength is 5, so the query ID is truncated
+    val truncatedQueryId = testQueryId.take(5)
+    val expectedQueryPrefix = s"[queryId = $truncatedQueryId]"
+    val expectedBatchPrefix = s"[batchId = $testBatchId]"
+
+    // Verify the "Starting" log line includes query Id and batch Id
+    val startingLogs = logs.filter(msg =>
+      msg.contains("Starting") &&
+        msg.contains(expectedQueryPrefix) && msg.contains(expectedBatchPrefix))
+    assert(startingLogs.nonEmpty,
+      s"Expected 'Starting' log to contain '$expectedQueryPrefix' and '$expectedBatchPrefix'." +
+        s"\nCaptured logs:\n${logs.mkString("\n")}")
+
+    // Verify the "Finished" log line includes query Id and batch Id
+    val finishedLogs = logs.filter(msg =>
+      msg.contains("Finished") &&
+        msg.contains(expectedQueryPrefix) && msg.contains(expectedBatchPrefix))
+    assert(finishedLogs.nonEmpty,
+      s"Expected 'Finished' log to contain '$expectedQueryPrefix' and '$expectedBatchPrefix'." +
+        s"\nCaptured logs:\n${logs.mkString("\n")}")
+  }
+
+  test("SPARK-57491: late-arriving speculative ShuffleMapTask marks stale partitionId") {
+    sc = new SparkContext("local", "test")
+    sched = new FakeTaskScheduler(sc, ("exec1", "host1"), ("exec2", "host2"), ("exec3", "host3"))
+    sc.conf.set(config.SPECULATION_MULTIPLIER, 0.0)
+    sc.conf.set(config.SPECULATION_ENABLED, true)
+
+    val taskSet = FakeTask.createShuffleMapTaskSet(2, 0, 0,
+      Seq(TaskLocation("host1", "exec1")),
+      Seq(TaskLocation("host2", "exec2")))
+    val clock = new ManualClock()
+    val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES, clock = clock)
+    val accumUpdatesByTask: Array[Seq[AccumulatorV2[_, _]]] = taskSet.tasks.map { task =>
+      task.metrics.internalAccums
+    }
+
+    // Register shuffle in MapOutputTrackerMaster so detectStalePushIfShuffleTask can find it
+    val mapOutputTrackerMaster = sched.mapOutputTracker
+    val shuffleId = taskSet.shuffleId.get
+    mapOutputTrackerMaster.registerShuffle(shuffleId, 2, 2)
+
+    // Offer resources for 2 tasks to start
+    val task0 = manager.resourceOffer("exec1", "host1", PROCESS_LOCAL)._1.get
+    val task1 = manager.resourceOffer("exec2", "host2", PROCESS_LOCAL)._1.get
+    assert(task0.index === 0)
+    assert(task1.index === 1)
+
+    // Advance clock so tasks have been running long enough (markFinished requires time > 0)
+    clock.advance(1)
+
+    // Complete task 1 (partition 1) successfully with a MapStatus
+    val mapStatus1 = MapStatus(BlockManagerId("exec2", "host2", 2000), Array(2L, 2L), mapTaskId = 1)
+    val result1 = createMapStatusTaskResult(mapStatus1, accumUpdatesByTask(1))
+    manager.handleSuccessfulTask(task1.taskId, result1)
+    assert(sched.endedTasks(task1.index) === Success)
+
+    // Advance clock so task 0 has been running long enough for speculation.
+    // checkSpeculatableTasks requires tasks to have been running > 0ms when threshold is 0.
+    clock.advance(1)
+    assert(manager.checkSpeculatableTasks(0))
+    assert(sched.speculativeTasks.toSet === Set(0))
+
+    // Offer resource to start the speculative attempt for partition 0 on a different host
+    val specTaskOption = manager.resourceOffer("exec3", "host3", ANY)._1
+    assert(specTaskOption.isDefined, "Expected speculative task to be launched")
+    val specTask = specTaskOption.get
+    assert(specTask.index === 0)
+    assert(specTask.attemptNumber === 1)
+
+    // Replace backend with mock before completing original task 0, to handle killTask call
+    sched.backend = mock(classOf[SchedulerBackend])
+    sched.dagScheduler.stop()
+    sched.dagScheduler = mock(classOf[DAGScheduler])
+
+    // Complete original task 0 (partition 0) - this will kill the speculative attempt
+    val mapStatus0 = MapStatus(BlockManagerId("exec1", "host1", 1000), Array(1L, 1L), mapTaskId = 0)
+    val result0 = createMapStatusTaskResult(mapStatus0, accumUpdatesByTask(0))
+    manager.handleSuccessfulTask(task0.taskId, result0)
+
+    // Verify no stale pushed map indexes yet (stale is only marked when late result arrives)
+    assert(mapOutputTrackerMaster.getStaleMapIndexes(shuffleId).isEmpty)
+
+    // Now the speculative attempt's result arrives late. Since task 0 already succeeded,
+    // handleSuccessfulTask will see successful(0)=true and killedByOtherAttempt contains
+    // the speculative tid, triggering detectStalePushIfShuffleTask.
+    val specMapStatus = MapStatus(
+      BlockManagerId("exec3", "host3", 3000), Array(3L, 3L), mapTaskId = 999)
+    val specResult = createMapStatusTaskResult(specMapStatus, accumUpdatesByTask(0))
+    manager.handleSuccessfulTask(specTask.taskId, specResult)
+
+    // Verify that partition 0 is now tracked as stale
+    val staleMapIndexes = mapOutputTrackerMaster.getStaleMapIndexes(shuffleId)
+    assert(staleMapIndexes.contains(0),
+      s"Expected staleMapIndexes to contain mapIndex 0, got $staleMapIndexes")
+  }
+
+  private def createMapStatusTaskResult(
+      mapStatus: MapStatus,
+      accumUpdates: Seq[AccumulatorV2[_, _]],
+      metricPeaks: Array[Long] = Array.empty): DirectTaskResult[MapStatus] = {
+    val valueSer = SparkEnv.get.serializer.newInstance()
+    new DirectTaskResult[MapStatus](valueSer.serialize(mapStatus), accumUpdates, metricPeaks)
+  }
+
+  // SPARK-57465: With the fix, ExecutorShutdownFailure does NOT count toward task failures
+  // (contrast: a normal ExceptionFailure DOES count)
+  test("SPARK-57465: ExecutorShutdownFailure does not count toward task failures") {
+    sc = new SparkContext("local", "test")
+    sched = new FakeTaskScheduler(sc, ("exec1", "host1"))
+    val taskSet = FakeTask.createTaskSet(1)
+    val clock = new ManualClock(1)
+    val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES, clock = clock)
+
+    val failureReason = ExecutorShutdownFailure("exec1")
+    assert(failureReason.countTowardsTaskFailures === false)
+
+    // Fail the task MAX_TASK_FAILURES times with ExecutorShutdownFailure
+    for (attempt <- 0 until MAX_TASK_FAILURES) {
+      clock.advance(1)
+      val taskOption = manager.resourceOffer("exec1", "host1", ANY)._1
+      assert(taskOption.isDefined, s"Task should still be schedulable at attempt $attempt")
+      manager.handleFailedTask(taskOption.get.taskId, TaskState.FAILED, failureReason)
+    }
+
+    // The stage should NOT be aborted - failures don't count
+    assert(!manager.isZombie,
+      "Stage should NOT be zombie - ExecutorShutdownFailure must not count")
+    assert(!sched.taskSetsFailed.contains("0.0"),
+      "TaskSet should NOT be failed/aborted")
+
+    // Task should still be schedulable
+    clock.advance(1)
+    val taskOption = manager.resourceOffer("exec1", "host1", ANY)._1
+    assert(taskOption.isDefined, "Task should still be schedulable after non-counting failures")
+
+    // Contrast: a normal ExceptionFailure DOES count toward task failures
+    val exceptionFailure = new ExceptionFailure(
+      "java.lang.RuntimeException", "test failure",
+      Array.empty, "java.lang.RuntimeException: test failure", None)
+    assert(exceptionFailure.countTowardsTaskFailures === true)
+    manager.handleFailedTask(taskOption.get.taskId, TaskState.FAILED, exceptionFailure)
+    val numFailures = PrivateMethod[Array[Int]](Symbol("numFailures"))
+    assert(manager.invokePrivate(numFailures())(0) === 1,
+      "ExceptionFailure must count towards task failures (contrast)")
   }
 
 }

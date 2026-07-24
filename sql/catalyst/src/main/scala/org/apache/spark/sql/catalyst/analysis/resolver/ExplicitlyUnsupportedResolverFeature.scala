@@ -21,7 +21,7 @@ package org.apache.spark.sql.catalyst.analysis.resolver
  * This is an addon to [[ResolverGuard]] functionality for features that cannot be determined by
  * only looking at the unresolved plan. [[Resolver]] will throw this control-flow exception
  * when it encounters some explicitly unsupported feature. Later behavior depends on the value of
- * [[HybridAnalyzer.exposeExplicitlyUnsupportedResolverFeature]] flag:
+ * [[ANALYZER_SINGLE_PASS_RESOLVER_EXPOSE_EXPLICITLY_UNSUPPORTED_FEATURE_IN_DUAL_RUNS]] flag:
  *  - If it is true: It will later be caught by [[HybridAnalyzer]] to abort single-pass
  *    analysis without comparing single-pass and fixed-point results. The motivation for this
  *    feature is the same as for the [[ResolverGuard]] - we want to have an explicit allowlist of
@@ -51,6 +51,8 @@ object ExplicitlyUnsupportedResolverFeature {
   val OPERATORS = Set(
     "org.apache.spark.sql.catalyst.streaming.StreamingRelationV2",
     "org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation",
-    "org.apache.spark.sql.execution.streaming.StreamingRelation"
+    "org.apache.spark.sql.execution.streaming.StreamingRelation",
+    "org.apache.spark.sql.metricview.logical.MetricViewPlaceholder",
+    "org.apache.spark.sql.metricview.logical.ResolvedMetricView"
   )
 }

@@ -180,6 +180,7 @@ String Functions
     initcap
     instr
     is_valid_utf8
+    jaro_winkler_similarity
     lcase
     left
     length
@@ -298,8 +299,16 @@ Date and Timestamp Functions
     timestamp_diff
     timestamp_micros
     timestamp_millis
+    timestamp_nanos
     timestamp_seconds
+    time_bucket
     time_diff
+    time_from_micros
+    time_from_millis
+    time_from_seconds
+    time_to_micros
+    time_to_millis
+    time_to_seconds
     time_trunc
     to_date
     to_time
@@ -319,6 +328,7 @@ Date and Timestamp Functions
     unix_date
     unix_micros
     unix_millis
+    unix_nanos
     unix_seconds
     unix_timestamp
     weekday
@@ -519,6 +529,7 @@ Window Functions
 .. autosummary::
     :toctree: api/
 
+    counter_diff
     cume_dist
     dense_rank
     lag
@@ -585,12 +596,19 @@ VARIANT Functions
 .. autosummary::
     :toctree: api/
 
+    is_valid_variant
     is_variant_null
     parse_json
     schema_of_variant
     schema_of_variant_agg
     try_variant_get
+    variant_array_append
+    try_variant_array_append
+    variant_delete
     variant_get
+    variant_insert
+    try_variant_insert
+    variant_set
     try_parse_json
     to_variant_object
 
@@ -639,8 +657,10 @@ Misc Functions
     bitmap_count
     current_catalog
     current_database
+    current_path
     current_schema
     current_user
+    hmac
     input_file_block_length
     input_file_block_start
     input_file_name
@@ -713,6 +733,20 @@ Geospatial ST Functions
     st_geomfromwkb
     st_setsrid
     st_srid
+
+
+Vector Functions
+----------------
+.. autosummary::
+    :toctree: api/
+
+    vector_cosine_similarity
+    vector_inner_product
+    vector_l2_distance
+    vector_norm
+    vector_normalize
+    vector_avg
+    vector_sum
 
 
 UDF, UDTF and UDT

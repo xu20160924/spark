@@ -23,7 +23,6 @@ import java.nio.file.{Files, Path}
 import java.util.{Locale, TimeZone}
 
 import scala.collection.mutable.ArrayBuffer
-import scala.jdk.CollectionConverters._
 
 import org.apache.logging.log4j._
 import org.apache.logging.log4j.core.{LogEvent, Logger, LoggerContext}
@@ -70,6 +69,7 @@ trait SparkTestSuite
     with BeforeAndAfterEach
     with ThreadAudit
     with TimeLimits
+    with CheckErrorHelper
     with Logging {
   // scalastyle:on
 
@@ -274,75 +274,6 @@ trait SparkTestSuite
     }
   }
 
-  /**
-   * Checks an exception with an error condition against expected results.
-   * @param exception     The exception to check
-   * @param condition     The expected error condition identifying the error
-   * @param sqlState      Optional the expected SQLSTATE, not verified if not supplied
-   * @param parameters    A map of parameter names and values. The names are as defined
-   *                      in the error-classes file.
-   * @param matchPVals    Optionally treat the parameters value as regular expression pattern.
-   *                      false if not supplied.
-   */
-  protected def checkError(
-      exception: SparkThrowable,
-      condition: String,
-      sqlState: Option[String] = None,
-      parameters: Map[String, String] = Map.empty,
-      matchPVals: Boolean = false,
-      queryContext: Array[ExpectedContext] = Array.empty): Unit = {
-    assert(exception.getCondition === condition)
-    sqlState.foreach(state => assert(exception.getSqlState === state))
-    val expectedParameters = exception.getMessageParameters.asScala
-    if (matchPVals) {
-      assert(expectedParameters.size === parameters.size)
-      expectedParameters.foreach(
-        exp => {
-          val parm = parameters.getOrElse(exp._1,
-            throw new IllegalArgumentException("Missing parameter" + exp._1))
-          if (!exp._2.matches(parm)) {
-            throw new IllegalArgumentException("For parameter '" + exp._1 + "' value '" + exp._2 +
-              "' does not match: " + parm)
-          }
-        }
-      )
-    } else {
-      assert(expectedParameters === parameters)
-    }
-    val actualQueryContext = exception.getQueryContext()
-    assert(actualQueryContext.length === queryContext.length, "Invalid length of the query context")
-    actualQueryContext.zip(queryContext).foreach { case (actual, expected) =>
-      assert(actual.contextType() === expected.contextType,
-        "Invalid contextType of a query context Actual:" + actual.toString)
-      if (actual.contextType() == QueryContextType.SQL) {
-        assert(actual.objectType() === expected.objectType,
-          "Invalid objectType of a query context Actual:" + actual.toString)
-        assert(actual.objectName() === expected.objectName,
-          "Invalid objectName of a query context. Actual:" + actual.toString)
-        // If startIndex and stopIndex are -1, it means we simply want to check the
-        // fragment of the query context. This should be the case when the fragment is
-        // distinguished within the query text.
-        if (expected.startIndex != -1) {
-          assert(actual.startIndex() === expected.startIndex,
-            "Invalid startIndex of a query context. Actual:" + actual.toString)
-        }
-        if (expected.stopIndex != -1) {
-          assert(actual.stopIndex() === expected.stopIndex,
-            "Invalid stopIndex of a query context. Actual:" + actual.toString)
-        }
-        assert(actual.fragment() === expected.fragment,
-          "Invalid fragment of a query context. Actual:" + actual.toString)
-      } else if (actual.contextType() == QueryContextType.DataFrame) {
-        assert(actual.fragment() === expected.fragment,
-          "Invalid code fragment of a query context. Actual:" + actual.toString)
-        if (expected.callSitePattern.nonEmpty) {
-          assert(actual.callSite().matches(expected.callSitePattern),
-            "Invalid callSite of a query context. Actual:" + actual.toString)
-        }
-      }
-    }
-  }
-
   protected def checkError(
       exception: SparkThrowable,
       condition: String,
@@ -402,7 +333,9 @@ trait SparkTestSuite
       queryContext: ExpectedContext): Unit =
     checkError(exception = exception,
       condition = "TABLE_OR_VIEW_NOT_FOUND",
-      parameters = Map("relationName" -> tableName),
+      parameters = Map(
+        "relationName" -> tableName,
+        "searchPath" -> Option(exception.getMessageParameters.get("searchPath")).getOrElse("")),
       queryContext = Array(queryContext))
 
   protected def checkErrorTableNotFound(
@@ -410,7 +343,35 @@ trait SparkTestSuite
       tableName: String): Unit =
     checkError(exception = exception,
       condition = "TABLE_OR_VIEW_NOT_FOUND",
-      parameters = Map("relationName" -> tableName))
+      parameters = Map(
+        "relationName" -> tableName,
+        "searchPath" -> Option(exception.getMessageParameters.get("searchPath")).getOrElse(""))
+    )
+
+  protected val defaultSearchPathForTests: String =
+    "[`system`.`builtin`, `system`.`session`, `spark_catalog`.`default`]"
+
+  protected def checkErrorTableNotFoundWithSearchPath(
+      exception: SparkThrowable,
+      tableName: String,
+      searchPath: String = defaultSearchPathForTests): Unit =
+    checkError(exception = exception,
+      condition = "TABLE_OR_VIEW_NOT_FOUND",
+      parameters = Map(
+        "relationName" -> tableName,
+        "searchPath" -> searchPath))
+
+  protected def checkErrorTableNotFoundWithSearchPath(
+      exception: SparkThrowable,
+      tableName: String,
+      queryContext: ExpectedContext,
+      searchPath: String): Unit =
+    checkError(exception = exception,
+      condition = "TABLE_OR_VIEW_NOT_FOUND",
+      parameters = Map(
+        "relationName" -> tableName,
+        "searchPath" -> searchPath),
+      queryContext = Array(queryContext))
 
   protected def checkErrorTableAlreadyExists(
       exception: SparkThrowable,
@@ -418,42 +379,6 @@ trait SparkTestSuite
     checkError(exception = exception,
       condition = "TABLE_OR_VIEW_ALREADY_EXISTS",
       parameters = Map("relationName" -> tableName))
-
-  case class ExpectedContext(
-      contextType: QueryContextType,
-      objectType: String,
-      objectName: String,
-      startIndex: Int,
-      stopIndex: Int,
-      fragment: String,
-      callSitePattern: String
-  )
-
-  object ExpectedContext {
-    def apply(fragment: String, start: Int, stop: Int): ExpectedContext = {
-      ExpectedContext("", "", start, stop, fragment)
-    }
-
-    // Check the fragment only. This is only used when the fragment is distinguished within
-    // the query text
-    def apply(fragment: String): ExpectedContext = {
-      ExpectedContext("", "", -1, -1, fragment)
-    }
-
-    def apply(
-        objectType: String,
-        objectName: String,
-        startIndex: Int,
-        stopIndex: Int,
-        fragment: String): ExpectedContext = {
-      new ExpectedContext(QueryContextType.SQL, objectType, objectName, startIndex, stopIndex,
-        fragment, "")
-    }
-
-    def apply(fragment: String, callSitePattern: String): ExpectedContext = {
-      new ExpectedContext(QueryContextType.DataFrame, "", "", -1, -1, fragment, callSitePattern)
-    }
-  }
 
   class LogAppender(msg: String = "", maxEvents: Int = 1000)
       extends AbstractAppender("logAppender", null, null, true, Property.EMPTY_ARRAY) {

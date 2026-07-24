@@ -26,8 +26,7 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, CodeGenerator, ExprCode}
 import org.apache.spark.sql.catalyst.plans.physical._
-import org.apache.spark.sql.catalyst.util.DateTimeConstants.NANOS_PER_MILLIS
-import org.apache.spark.sql.execution.metric.SQLMetrics
+import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 
 /**
  * Performs (external) sorting.
@@ -62,9 +61,10 @@ case class SortExec(
     "peakMemory" -> SQLMetrics.createSizeMetric(sparkContext, "peak memory"),
     "spillSize" -> SQLMetrics.createSizeMetric(sparkContext, "spill size"))
 
-  // Each task has its own instance of UnsafeExternalRowSorter. It is created in the
-  // createSorter method and stored in a ThreadLocal variable.
-  private[sql] var rowSorter: ThreadLocal[UnsafeExternalRowSorter] = _
+  // WARNING: This is a shared mutable var on the SortExec instance. Do not access it from
+  // multiple threads concurrently - Spark operators do not guarantee thread-safety and one
+  // task's sorter could overwrite another's, causing a race condition.
+  private[sql] var rowSorter: UnsafeExternalRowSorter = _
 
   /**
    * This method gets invoked only once for each SortExec instance to initialize an
@@ -73,8 +73,6 @@ case class SortExec(
    * should make it public.
    */
   def createSorter(): UnsafeExternalRowSorter = {
-    rowSorter = new ThreadLocal[UnsafeExternalRowSorter]()
-
     val ordering = RowOrdering.create(sortOrder, output)
 
     // The comparator for comparing prefix
@@ -99,14 +97,13 @@ case class SortExec(
     }
 
     val pageSize = SparkEnv.get.memoryManager.pageSizeBytes
-    val newRowSorter = UnsafeExternalRowSorter.create(
+    rowSorter = UnsafeExternalRowSorter.create(
       schema, ordering, prefixComparator, prefixComputer, pageSize, canUseRadixSort)
 
     if (testSpillFrequency > 0) {
-      newRowSorter.setTestSpillFrequency(testSpillFrequency)
+      rowSorter.setTestSpillFrequency(testSpillFrequency)
     }
-    rowSorter.set(newRowSorter)
-    rowSorter.get()
+    rowSorter
   }
 
   protected override def doExecute(): RDD[InternalRow] = {
@@ -122,10 +119,7 @@ case class SortExec(
       // figure out how many bytes we spilled for this operator.
       val spillSizeBefore = metrics.memoryBytesSpilled
       val sortedIterator = sorter.sort(iter.asInstanceOf[Iterator[UnsafeRow]])
-      sortTime += NANOSECONDS.toMillis(sorter.getSortTimeNanos)
-      peakMemory += sorter.getPeakMemoryUsage
-      spillSize += metrics.memoryBytesSpilled - spillSizeBefore
-      metrics.incPeakExecutionMemory(sorter.getPeakMemoryUsage)
+      SortExec.recordSortMetrics(sorter, metrics, spillSizeBefore, sortTime, peakMemory, spillSize)
 
       sortedIterator
     }
@@ -156,9 +150,12 @@ case class SortExec(
       forceInline = true)
 
     val addToSorter = ctx.freshName("addToSorter")
+    // Pass `partitionIndex` as a parameter so bare references in the child's
+    // produce resolve to the local, not the protected superclass field.
+    // Required when `addNewFunction` spills this helper to a nested class.
     val addToSorterFuncName = ctx.addNewFunction(addToSorter,
       s"""
-        | private void $addToSorter() throws java.io.IOException {
+        | private void $addToSorter(int partitionIndex) throws java.io.IOException {
         |   ${child.asInstanceOf[CodegenSupport].produce(ctx, this)}
         | }
       """.stripMargin.trim)
@@ -171,12 +168,10 @@ case class SortExec(
     s"""
        | if ($needToSort) {
        |   long $spillSizeBefore = $metrics.memoryBytesSpilled();
-       |   $addToSorterFuncName();
+       |   $addToSorterFuncName(partitionIndex);
        |   $sortedIterator = $sorterVariable.sort();
-       |   $sortTime.add($sorterVariable.getSortTimeNanos() / $NANOS_PER_MILLIS);
-       |   $peakMemory.add($sorterVariable.getPeakMemoryUsage());
-       |   $spillSize.add($metrics.memoryBytesSpilled() - $spillSizeBefore);
-       |   $metrics.incPeakExecutionMemory($sorterVariable.getPeakMemoryUsage());
+       |   org.apache.spark.sql.execution.SortExec.recordSortMetrics(
+       |     $sorterVariable, $metrics, $spillSizeBefore, $sortTime, $peakMemory, $spillSize);
        |   $needToSort = false;
        | }
        |
@@ -196,18 +191,42 @@ case class SortExec(
   }
 
   /**
-   * In SortExec, we overwrites cleanupResources to close UnsafeExternalRowSorter.
+   * In SortExec, we overwrite cleanupResources to close UnsafeExternalRowSorter.
+   * There's possible for rowSorter to be null here, for example, in the scenario of empty iterator
+   * in the current task, the downstream physical node (like SortMergeJoinExec) will trigger
+   * cleanupResources before rowSorter is initialized in createSorter.
    */
   override protected[sql] def cleanupResources(): Unit = {
-    if (rowSorter != null && rowSorter.get() != null) {
-      // There's possible for rowSorter is null here, for example, in the scenario of empty
-      // iterator in the current task, the downstream physical node(like SortMergeJoinExec) will
-      // trigger cleanupResources before rowSorter initialized in createSorter.
-      rowSorter.get().cleanupResources()
+    if (rowSorter != null) {
+      rowSorter.cleanupResources()
     }
     super.cleanupResources()
   }
 
   override protected def withNewChildInternal(newChild: SparkPlan): SortExec =
     copy(child = newChild)
+}
+
+object SortExec {
+  /**
+   * Records the sort metrics (sort time, peak memory and spill size) for a completed sort. This
+   * is called both by the interpreted path ([[SortExec.doExecute]]) and by the generated code of
+   * [[SortExec]] (through the static forwarder), so the type-independent metric bookkeeping is
+   * compiled once per JVM instead of being re-emitted into every SortExec stage's generated code.
+   *
+   * `spillSizeBefore` is the task's spilled-bytes count captured before the rows were fed to the
+   * sorter, so that `spillSize` reflects only this operator's contribution.
+   */
+  def recordSortMetrics(
+      sorter: UnsafeExternalRowSorter,
+      metrics: TaskMetrics,
+      spillSizeBefore: Long,
+      sortTime: SQLMetric,
+      peakMemory: SQLMetric,
+      spillSize: SQLMetric): Unit = {
+    sortTime += NANOSECONDS.toMillis(sorter.getSortTimeNanos)
+    peakMemory += sorter.getPeakMemoryUsage
+    spillSize += metrics.memoryBytesSpilled - spillSizeBefore
+    metrics.incPeakExecutionMemory(sorter.getPeakMemoryUsage)
+  }
 }

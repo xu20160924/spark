@@ -54,13 +54,21 @@ trait SparkConnectServerTest extends SharedSparkSession {
 
   val allocator = new RootAllocator()
 
+  // Additional server-side confs to set (via withSparkEnvConfs) before starting the real
+  // service. Override in subclasses that need to exercise non-default Connect server behavior
+  // (e.g. tuning gRPC keepalive) through the actual production startGRPCService() wiring,
+  // rather than only through hand-built test doubles.
+  protected def extraServerConfs: Seq[(String, String)] = Seq.empty
+
   override def beforeAll(): Unit = {
     super.beforeAll()
     // Other suites using mocks leave a mess in the global executionManager,
     // shut it down so that it's cleared before starting server.
     SparkConnectService.executionManager.shutdown()
     // Start the real service.
-    withSparkEnvConfs((Connect.CONNECT_GRPC_BINDING_PORT.key, serverPort.toString)) {
+    withSparkEnvConfs(
+      (Seq(
+        (Connect.CONNECT_GRPC_BINDING_PORT.key, serverPort.toString)) ++ extraServerConfs): _*) {
       SparkConnectService.start(spark.sparkContext)
     }
   }
@@ -196,11 +204,13 @@ trait SparkConnectServerTest extends SharedSparkSession {
     }
   }
 
-  protected def assertEventuallyNoActiveRpcs(): Unit = {
+  protected def eventuallyWithTimeout[T](f: => T): T = {
     Eventually.eventually(timeout(eventuallyTimeout)) {
-      assertNoActiveRpcs()
+      f
     }
   }
+
+  protected def assertEventuallyNoActiveRpcs(): Unit = eventuallyWithTimeout(assertNoActiveRpcs())
 
   protected def assertNoActiveExecutions(): Unit = {
     SparkConnectService.executionManager.listActiveExecutions match {
@@ -209,11 +219,8 @@ trait SparkConnectServerTest extends SharedSparkSession {
     }
   }
 
-  protected def assertEventuallyNoActiveExecutions(): Unit = {
-    Eventually.eventually(timeout(eventuallyTimeout)) {
-      assertNoActiveExecutions()
-    }
-  }
+  protected def assertEventuallyNoActiveExecutions(): Unit =
+    eventuallyWithTimeout(assertNoActiveExecutions())
 
   protected def assertExecutionReleased(operationId: String): Unit = {
     SparkConnectService.executionManager.listActiveExecutions match {
@@ -222,11 +229,8 @@ trait SparkConnectServerTest extends SharedSparkSession {
     }
   }
 
-  protected def assertEventuallyExecutionReleased(operationId: String): Unit = {
-    Eventually.eventually(timeout(eventuallyTimeout)) {
-      assertExecutionReleased(operationId)
-    }
-  }
+  protected def assertEventuallyExecutionReleased(operationId: String): Unit =
+    eventuallyWithTimeout(assertExecutionReleased(operationId))
 
   // Get ExecutionHolder, assuming that only one execution is active
   protected def getExecutionHolder: ExecuteHolder = {
@@ -235,11 +239,14 @@ trait SparkConnectServerTest extends SharedSparkSession {
     executions.head
   }
 
-  protected def eventuallyGetExecutionHolder: ExecuteHolder = {
-    Eventually.eventually(timeout(eventuallyTimeout)) {
-      getExecutionHolder
-    }
-  }
+  protected def getExecutionHolderForOperation(opId: String): ExecuteHolder =
+    SparkConnectService.executionManager.listExecuteHolders.find(_.key.operationId == opId).get
+
+  protected def eventuallyGetExecutionHolderForOperation(opId: String): ExecuteHolder =
+    eventuallyWithTimeout(getExecutionHolderForOperation(opId))
+
+  protected def eventuallyGetExecutionHolder: ExecuteHolder =
+    eventuallyWithTimeout(getExecutionHolder)
 
   protected def withClient(sessionId: String = defaultSessionId, userId: String = defaultUserId)(
       f: SparkConnectClient => Unit): Unit = {
@@ -281,9 +288,9 @@ trait SparkConnectServerTest extends SharedSparkSession {
   protected def withCustomBlockingStub(
       retryPolicies: Seq[RetryPolicy] = RetryPolicy.defaultPolicies())(
       f: CustomSparkConnectBlockingStub => Unit): Unit = {
-    val conf = SparkConnectClient.Configuration(port = serverPort)
+    val conf = SparkConnectClient.Configuration(port = serverPort, retryPolicies = retryPolicies)
     val channel = conf.createChannel()
-    val stubState = new SparkConnectStubState(channel, retryPolicies)
+    val stubState = new SparkConnectStubState(channel, conf)
     val bstub = new CustomSparkConnectBlockingStub(channel, stubState)
     try f(bstub)
     finally {

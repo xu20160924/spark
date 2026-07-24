@@ -179,6 +179,80 @@ private[spark] class DAGScheduler(
 
   private[spark] val jobIdToQueryExecutionId = new ConcurrentHashMap[Int, java.lang.Long]()
 
+  // The maps below back the test-only INJECT_SHUFFLE_FETCH_FAILURES machinery, keyed by the
+  // globally-unique (never-reused) shuffleId. They are always allocated rather than gated on
+  // `Utils.isTesting`: that helper reads the mutable `spark.testing` system property, so it can
+  // return a different value when this DAGScheduler is constructed than at the later use-sites.
+  // A construction-time `else null` would then be dereferenced by a use-site that re-checks
+  // `Utils.isTesting` and sees `true`, throwing an NPE that crashes the event loop. The maps are
+  // only ever populated inside the config-gated test paths, so in production they stay empty and
+  // carry no behavioral cost beyond an empty map. Entries are evicted when the shuffle's map
+  // outputs are unregistered (via the CleanerListener attached lazily in
+  // ensureInjectShuffleFetchFailuresCleanerListenerForTest), not on stage removal: under AQE each
+  // Exchange is materialized as its own map-stage job whose stage is removed before the consuming
+  // stage runs, so evicting on stage removal would drop a pending corruption before its consumer
+  // is ever submitted.
+
+  // For INJECT_SHUFFLE_FETCH_FAILURES: per-shuffleId, the stage attempt whose partition-0 task
+  // we corrupted. Read to (a) avoid re-corrupting that partition on recompute, and (b) decide
+  // when to fire INJECT_SHUFFLE_FORCE_CHECKSUM_MISMATCH_ON_RECOMPUTE - the recompute is the
+  // task whose stageAttemptId is not the recorded one.
+  private val injectShuffleFetchFailuresCorruptedAttempt: ConcurrentHashMap[Int, Int] =
+    new ConcurrentHashMap[Int, Int]()
+
+  // For INJECT_SHUFFLE_FETCH_FAILURES_DOWNSTREAM_DELAY > 0: shuffles whose mapper-0 corruption
+  // has been deferred until enough downstream consumer tasks succeed. The value is the mapId
+  // we will eventually swap to an invalid BlockManagerId and the producing task's original
+  // location - we keep that location's host/port so the consumer's locality-preferred host
+  // is still a real one (only the executorId is INVALID_EXECUTOR_ID).
+  private val injectShuffleFetchFailuresPendingDelayedCorruption
+    : ConcurrentHashMap[Int, (Long, BlockManagerId)] =
+    new ConcurrentHashMap[Int, (Long, BlockManagerId)]()
+
+  // For INJECT_SHUFFLE_FETCH_FAILURES_DOWNSTREAM_DELAY: per-shuffle counter of consumer
+  // task-success events observed so far.
+  private val injectShuffleFetchFailuresDownstreamSuccessCount: ConcurrentHashMap[Int, Int] =
+    new ConcurrentHashMap[Int, Int]()
+
+  // Whether the CleanerListener that evicts the injectShuffleFetchFailures* maps on shuffle
+  // cleanup has been attached. Attached lazily (not in the constructor) because sc.cleaner is
+  // created after the DAGScheduler.
+  @volatile private var injectShuffleFetchFailuresCleanerAttached = false
+
+  // Lazily attach a CleanerListener that drops a shuffle's injectShuffleFetchFailures* entries
+  // when its map outputs are unregistered. Called from the test-gated injection path only, so it
+  // never runs in production. Runs on the single-threaded event loop, hence no extra locking.
+  private def ensureInjectShuffleFetchFailuresCleanerListenerForTest(): Unit = {
+    if (injectShuffleFetchFailuresCleanerAttached) return
+    sc.cleaner.foreach { cleaner =>
+      cleaner.attachListener(new CleanerListener {
+        override def rddCleaned(rddId: Int): Unit = {}
+        override def shuffleCleaned(shuffleId: Int): Unit = {
+          injectShuffleFetchFailuresCorruptedAttempt.remove(shuffleId)
+          injectShuffleFetchFailuresPendingDelayedCorruption.remove(shuffleId)
+          injectShuffleFetchFailuresDownstreamSuccessCount.remove(shuffleId)
+        }
+        override def broadcastCleaned(broadcastId: Long): Unit = {}
+        override def accumCleaned(accId: Long): Unit = {}
+        override def checkpointCleaned(rddId: Long): Unit = {}
+      })
+      injectShuffleFetchFailuresCleanerAttached = true
+    }
+  }
+
+  // Build the bogus BlockManagerId used by INJECT_SHUFFLE_FETCH_FAILURES to mark a corrupted
+  // MapStatus: keeps the original host/port/topology so the consumer's locality preference
+  // resolves to a real host; only the executorId is INVALID_EXECUTOR_ID, so any fetch from
+  // this location fails with FetchFailed.
+  private def injectShuffleFetchFailuresInvalidBlockManagerId(
+      currentLocation: BlockManagerId): BlockManagerId = {
+    BlockManagerId(
+      BlockManagerId.INVALID_EXECUTOR_ID,
+      currentLocation.host,
+      currentLocation.port,
+      currentLocation.topologyInfo)
+  }
+
   // Job groups that are cancelled with `cancelFutureJobs` as true, with at most
   // `NUM_CANCELLED_JOB_GROUPS_TO_TRACK` stored. On a new job submission, if its job group is in
   // this set, the job will be immediately cancelled.
@@ -247,15 +321,54 @@ private[spark] class DAGScheduler(
 
   /**
    * Number of consecutive stage attempts allowed before a stage is aborted.
+   * The consecutive counter is cleared when a stage succeeds, so failures from different
+   * "runs" of the same stage do not accumulate against this limit.
+   * See [[stageAbortReason]] for how this interacts with [[maxStageAttempts]].
    */
   private[scheduler] val maxConsecutiveStageAttempts =
     sc.conf.get(config.STAGE_MAX_CONSECUTIVE_ATTEMPTS)
 
   /**
-   * Max stage attempts allowed before a stage is aborted.
+   * Absolute ceiling on the total number of attempts ever made for a stage (consecutive or not).
+   * Computed as the maximum of [[maxConsecutiveStageAttempts]] and the configured value of
+   * [[config.STAGE_MAX_ATTEMPTS]], so that the total ceiling is never lower than the consecutive
+   * limit. See [[stageAbortReason]] for how this interacts with [[maxConsecutiveStageAttempts]].
    */
   private[scheduler] val maxStageAttempts: Int = {
     Math.max(maxConsecutiveStageAttempts, sc.conf.get(config.STAGE_MAX_ATTEMPTS))
+  }
+
+  /**
+   * If the stage must be aborted, returns `Some(abortMessage)` describing which limit was hit.
+   * If the stage may be retried, returns `None`.
+   *
+   * Two independent limits are enforced; whichever triggers first causes the stage to be aborted:
+   *  - [[maxConsecutiveStageAttempts]]: caps the number of *consecutive* failed attempts.
+   *    This counter is reset when the stage succeeds, so transient failures in a long-running
+   *    job do not permanently accumulate.
+   *  - [[maxStageAttempts]]: an absolute ceiling on the *total* number of attempts ever made
+   *    for a stage. The attempt counter it bounds (`nextAttemptId`) is never cleared.
+   *
+   * Additionally, if the test-only flag [[disallowStageRetryForTest]] is set, the stage is
+   * aborted regardless of the above limits.
+   */
+  private def stageAbortReason(
+      stage: Stage,
+      failureMessage: String): Option[String] = {
+    if (disallowStageRetryForTest) {
+      Some(s"$stage (${stage.name}) will not retry due to testing config." +
+        s" Most recent failure reason: $failureMessage")
+    } else if (stage.failedAttemptIds.size >= maxConsecutiveStageAttempts) {
+      Some(s"$stage (${stage.name}) has failed the maximum allowable" +
+        s" number of times: $maxConsecutiveStageAttempts." +
+        s" Most recent failure reason: $failureMessage")
+    } else if (stage.getNextAttemptId >= maxStageAttempts) {
+      Some(s"$stage (${stage.name}) has exceeded the maximum allowable" +
+        s" total stage attempts: $maxStageAttempts." +
+        s" Most recent failure reason: $failureMessage")
+    } else {
+      None
+    }
   }
 
   /**
@@ -285,6 +398,16 @@ private[spark] class DAGScheduler(
 
   private val messageScheduler =
     ThreadUtils.newDaemonSingleThreadScheduledExecutor("dag-scheduler-message")
+
+  private def scheduleResubmit(): Unit = {
+    messageScheduler.schedule(
+      new Runnable {
+        override def run(): Unit = eventProcessLoop.post(ResubmitFailedStages)
+      },
+      DAGScheduler.RESUBMIT_TIMEOUT,
+      TimeUnit.MILLISECONDS
+    )
+  }
 
   private[spark] var eventProcessLoop = new DAGSchedulerEventProcessLoop(this)
   // Used for test only. Some tests uses the same thread of the event poster to
@@ -683,26 +806,54 @@ private[spark] class DAGScheduler(
     }.toList
   }
 
-  /** Find ancestor shuffle dependencies that are not registered in shuffleToMapStage yet */
-  private def getMissingAncestorShuffleDependencies(
-      rdd: RDD[_]): ListBuffer[ShuffleDependency[_, _, _]] = {
-    val ancestors = new ListBuffer[ShuffleDependency[_, _, _]]
+  /**
+   * Like [[traverseRDDGraphUntil]], but does not support early termination. For each unvisited RDD,
+   * calls `visitor(rdd, enqueue)` where `enqueue` can be called to schedule additional RDDs for
+   * traversal.
+   */
+  private def traverseRDDGraph(rdd: RDD[_])(visitor: (RDD[_], RDD[_] => Unit) => Unit): Unit = {
+    traverseRDDGraphUntil(rdd) { (r, enqueue) =>
+      visitor(r, enqueue)
+      true
+    }
+  }
+
+  /**
+   * Traverses the RDD dependency graph using a manually maintained stack to prevent
+   * StackOverflowError caused by recursive traversal. For each unvisited RDD, calls
+   * `visitor(rdd, enqueue)` where `enqueue` can be called to schedule additional RDDs for
+   * traversal. If `visitor` returns `false`, the traversal stops immediately. Returns `true`
+   * if the traversal completed normally, `false` if it was terminated early by the visitor.
+   */
+  private def traverseRDDGraphUntil(
+      rdd: RDD[_])(visitor: (RDD[_], RDD[_] => Unit) => Boolean): Boolean = {
     val visited = new HashSet[RDD[_]]
-    // We are manually maintaining a stack here to prevent StackOverflowError
-    // caused by recursively visiting
     val waitingForVisit = new ListBuffer[RDD[_]]
     waitingForVisit += rdd
+    def enqueue(r: RDD[_]): Unit = waitingForVisit.prepend(r)
     while (waitingForVisit.nonEmpty) {
       val toVisit = waitingForVisit.remove(0)
       if (!visited(toVisit)) {
         visited += toVisit
-        val (shuffleDeps, _) = getShuffleDependenciesAndResourceProfiles(toVisit)
-        shuffleDeps.foreach { shuffleDep =>
-          if (!shuffleIdToMapStage.contains(shuffleDep.shuffleId)) {
-            ancestors.prepend(shuffleDep)
-            waitingForVisit.prepend(shuffleDep.rdd)
-          } // Otherwise, the dependency and its ancestors have already been registered.
+        if (!visitor(toVisit, enqueue)) {
+          return false
         }
+      }
+    }
+    true
+  }
+
+  /** Find ancestor shuffle dependencies that are not registered in shuffleIdToMapStage yet */
+  private def getMissingAncestorShuffleDependencies(
+      rdd: RDD[_]): ListBuffer[ShuffleDependency[_, _, _]] = {
+    val ancestors = new ListBuffer[ShuffleDependency[_, _, _]]
+    traverseRDDGraph(rdd) { (toVisit, enqueue) =>
+      val (shuffleDeps, _) = getShuffleDependenciesAndResourceProfiles(toVisit)
+      shuffleDeps.foreach { shuffleDep =>
+        if (!shuffleIdToMapStage.contains(shuffleDep.shuffleId)) {
+          ancestors.prepend(shuffleDep)
+          enqueue(shuffleDep.rdd)
+        } // Otherwise, the dependency and its ancestors have already been registered.
       }
     }
     ancestors
@@ -725,20 +876,13 @@ private[spark] class DAGScheduler(
       rdd: RDD[_]): (HashSet[ShuffleDependency[_, _, _]], HashSet[ResourceProfile]) = {
     val parents = new HashSet[ShuffleDependency[_, _, _]]
     val resourceProfiles = new HashSet[ResourceProfile]
-    val visited = new HashSet[RDD[_]]
-    val waitingForVisit = new ListBuffer[RDD[_]]
-    waitingForVisit += rdd
-    while (waitingForVisit.nonEmpty) {
-      val toVisit = waitingForVisit.remove(0)
-      if (!visited(toVisit)) {
-        visited += toVisit
-        Option(toVisit.getResourceProfile()).foreach(resourceProfiles += _)
-        toVisit.dependencies.foreach {
-          case shuffleDep: ShuffleDependency[_, _, _] =>
-            parents += shuffleDep
-          case dependency =>
-            waitingForVisit.prepend(dependency.rdd)
-        }
+    traverseRDDGraph(rdd) { (toVisit, enqueue) =>
+      Option(toVisit.getResourceProfile()).foreach(resourceProfiles += _)
+      toVisit.dependencies.foreach {
+        case shuffleDep: ShuffleDependency[_, _, _] =>
+          parents += shuffleDep
+        case dependency =>
+          enqueue(dependency.rdd)
       }
     }
     (parents, resourceProfiles)
@@ -749,71 +893,54 @@ private[spark] class DAGScheduler(
    * RDDs satisfy a given predicate.
    */
   private def traverseParentRDDsWithinStage(rdd: RDD[_], predicate: RDD[_] => Boolean): Boolean = {
-    val visited = new HashSet[RDD[_]]
-    val waitingForVisit = new ListBuffer[RDD[_]]
-    waitingForVisit += rdd
-    while (waitingForVisit.nonEmpty) {
-      val toVisit = waitingForVisit.remove(0)
-      if (!visited(toVisit)) {
-        if (!predicate(toVisit)) {
-          return false
-        }
-        visited += toVisit
+    traverseRDDGraphUntil(rdd) { (toVisit, enqueue) =>
+      if (!predicate(toVisit)) {
+        false
+      } else {
         toVisit.dependencies.foreach {
           case _: ShuffleDependency[_, _, _] =>
-            // Not within the same stage with current rdd, do nothing.
+            // Not within the same stage as the current RDD, do nothing.
           case dependency =>
-            waitingForVisit.prepend(dependency.rdd)
+            enqueue(dependency.rdd)
         }
+        true
       }
     }
-    true
   }
 
   private def getMissingParentStages(stage: Stage): List[Stage] = {
     val missing = new HashSet[Stage]
-    val visited = new HashSet[RDD[_]]
-    // We are manually maintaining a stack here to prevent StackOverflowError
-    // caused by recursively visiting
-    val waitingForVisit = new ListBuffer[RDD[_]]
-    waitingForVisit += stage.rdd
-    def visit(rdd: RDD[_]): Unit = {
-      if (!visited(rdd)) {
-        visited += rdd
-        val rddHasUncachedPartitions = try {
-          getCacheLocs(rdd).contains(Nil)
-        } catch {
-          case e: RpcTimeoutException =>
-            logWarning(log"Failed to get cache locations for RDD ${MDC(RDD_ID, rdd.id)} due " +
-              log"to rpc timeout, assuming not fully cached.", e)
-            true
-        }
-        if (rddHasUncachedPartitions) {
-          for (dep <- rdd.dependencies) {
-            dep match {
-              case shufDep: ShuffleDependency[_, _, _] =>
-                val mapStage = getOrCreateShuffleMapStage(shufDep, stage.firstJobId)
-                // Mark mapStage as available with shuffle outputs only after shuffle merge is
-                // finalized with push based shuffle. If not, subsequent ShuffleMapStage won't
-                // read from merged output as the MergeStatuses are not available.
-                if (!mapStage.isAvailable || !mapStage.shuffleDep.shuffleMergeFinalized) {
-                  missing += mapStage
-                } else {
-                  // Forward the nextAttemptId if skipped and get visited for the first time.
-                  // Otherwise, once it gets retried,
-                  // 1) the stuffs in stage info become distorting, e.g. task num, input byte, e.t.c
-                  // 2) the first attempt starts from 0-idx, it will not be marked as a retry
-                  mapStage.increaseAttemptIdOnFirstSkip()
-                }
-              case narrowDep: NarrowDependency[_] =>
-                waitingForVisit.prepend(narrowDep.rdd)
-            }
+    traverseRDDGraph(stage.rdd) { (rdd, enqueue) =>
+      val rddHasUncachedPartitions = try {
+        getCacheLocs(rdd).contains(Nil)
+      } catch {
+        case e: RpcTimeoutException =>
+          logWarning(log"Failed to get cache locations for RDD ${MDC(RDD_ID, rdd.id)} due " +
+            log"to rpc timeout, assuming not fully cached.", e)
+          true
+      }
+      if (rddHasUncachedPartitions) {
+        for (dep <- rdd.dependencies) {
+          dep match {
+            case shufDep: ShuffleDependency[_, _, _] =>
+              val mapStage = getOrCreateShuffleMapStage(shufDep, stage.firstJobId)
+              // Mark mapStage as available with shuffle outputs only after shuffle merge is
+              // finalized with push based shuffle. If not, subsequent ShuffleMapStage won't
+              // read from merged output as the MergeStatuses are not available.
+              if (!mapStage.isAvailable || !mapStage.shuffleDep.shuffleMergeFinalized) {
+                missing += mapStage
+              } else {
+                // Forward the nextAttemptId if skipped and visited for the first time.
+                // Otherwise, once it gets retried:
+                // 1) the stage info fields become skewed, e.g. task count, input bytes, etc.
+                // 2) the first attempt starts from 0-idx, it will not be marked as a retry
+                mapStage.increaseAttemptIdOnFirstSkip()
+              }
+            case narrowDep: NarrowDependency[_] =>
+              enqueue(narrowDep.rdd)
           }
         }
       }
-    }
-    while (waitingForVisit.nonEmpty) {
-      visit(waitingForVisit.remove(0))
     }
     missing.toList
   }
@@ -821,27 +948,12 @@ private[spark] class DAGScheduler(
   /** Invoke `.partitions` on the given RDD and all of its ancestors  */
   private def eagerlyComputePartitionsForRddAndAncestors(rdd: RDD[_]): Unit = {
     val startTime = System.nanoTime
-    val visitedRdds = new HashSet[RDD[_]]
-    // We are manually maintaining a stack here to prevent StackOverflowError
-    // caused by recursively visiting
-    val waitingForVisit = new ListBuffer[RDD[_]]
-    waitingForVisit += rdd
-
-    def visit(rdd: RDD[_]): Unit = {
-      if (!visitedRdds(rdd)) {
-        visitedRdds += rdd
-
-        // Eagerly compute:
-        rdd.partitions
-
-        for (dep <- rdd.dependencies) {
-          waitingForVisit.prepend(dep.rdd)
-        }
+    traverseRDDGraph(rdd) { (toVisit, enqueue) =>
+      // Eagerly compute:
+      toVisit.partitions
+      for (dep <- toVisit.dependencies) {
+        enqueue(dep.rdd)
       }
-    }
-
-    while (waitingForVisit.nonEmpty) {
-      visit(waitingForVisit.remove(0))
     }
     logDebug("eagerlyComputePartitionsForRddAndAncestors for RDD %d took %f seconds"
       .format(rdd.id, (System.nanoTime - startTime) / 1e9))
@@ -1580,6 +1692,128 @@ private[spark] class DAGScheduler(
     }
   }
 
+  /**
+   * Returns true when this just-completed shuffle map task should have its output corrupted by
+   * the test-only fetch-failure injection. We corrupt only the partition-0 task, and only on
+   * the stage attempt that first successfully completes partition 0 - latched into
+   * injectShuffleFetchFailuresCorruptedAttempt. Recomputes (later attempts) of that partition
+   * are left clean so the consumer can make progress on its retry. The latch is per-shuffle,
+   * so non-leaf stages whose earlier attempts failed on fetch from upstream are still
+   * corrupted on their first successful attempt.
+   */
+  private def shouldCorruptShuffleOutputForTest(shuffleId: Int, task: Task[_]): Boolean = {
+    if (task.partitionId != 0) return false
+    ensureInjectShuffleFetchFailuresCleanerListenerForTest()
+    val recorded = injectShuffleFetchFailuresCorruptedAttempt.computeIfAbsent(
+      shuffleId, _ => task.stageAttemptId)
+    recorded == task.stageAttemptId
+  }
+
+  /**
+   * Apply the test-only fetch-failure injection to this just-completed map task: with
+   * DOWNSTREAM_DELAY > 0 record the (mapId, original location) so
+   * maybeApplyDelayedCorruptionForTest can corrupt it later, otherwise update the MapStatus
+   * location to an invalid block manager id inline.
+   */
+  private def corruptShuffleOutputForTest(shuffleId: Int, status: MapStatus): Unit = {
+    val downstreamDelay =
+      sc.conf.get(config.Tests.INJECT_SHUFFLE_FETCH_FAILURES_DOWNSTREAM_DELAY)
+    if (downstreamDelay > 0) {
+      injectShuffleFetchFailuresPendingDelayedCorruption.put(
+        shuffleId, (status.mapId, status.location))
+    } else {
+      status.updateLocation(injectShuffleFetchFailuresInvalidBlockManagerId(status.location))
+    }
+  }
+
+  /**
+   * For INJECT_SHUFFLE_FORCE_CHECKSUM_MISMATCH_ON_RECOMPUTE: returns true when this shuffle map
+   * task is the recompute of a partition whose previous successful attempt was the one corrupted
+   * by INJECT_SHUFFLE_FETCH_FAILURES. Forcing the mismatch on the recompute drives the rollback
+   * path - downstream ShuffleMapStages get cleaned up and re-run fully, downstream ResultStages
+   * are aborted.
+   */
+  private def isForcedChecksumMismatchForTest(shuffleId: Int, task: Task[_]): Boolean = {
+    if (!sc.conf.get(config.Tests.INJECT_SHUFFLE_FORCE_CHECKSUM_MISMATCH_ON_RECOMPUTE)) return false
+    if (task.partitionId != 0) return false
+    val recorded =
+      injectShuffleFetchFailuresCorruptedAttempt.getOrDefault(shuffleId, -1)
+    recorded >= 0 && recorded != task.stageAttemptId
+  }
+
+  /**
+   * Apply the deferred mapper-0 corruption (configured via
+   * INJECT_SHUFFLE_FETCH_FAILURES_DOWNSTREAM_DELAY for ShuffleMapStage consumers and
+   * INJECT_SHUFFLE_FETCH_FAILURES_RESULT_STAGE_DELAY for ResultStage consumers) when enough
+   * consumer tasks have succeeded. Walks the just-completed stage's direct shuffle parents,
+   * increments the per-shuffle consumer-success counter, and corrupts the registered MapStatus
+   * when the counter reaches the configured delay.
+   */
+  private def maybeApplyDelayedCorruptionForTest(stage: Stage): Unit = {
+    if (!sc.conf.get(config.Tests.INJECT_SHUFFLE_FETCH_FAILURES)) return
+    if (injectShuffleFetchFailuresPendingDelayedCorruption.isEmpty) return
+    val isResultStage = stage.isInstanceOf[ResultStage]
+    val delay = if (isResultStage) {
+      sc.conf.get(config.Tests.INJECT_SHUFFLE_FETCH_FAILURES_RESULT_STAGE_DELAY)
+    } else {
+      sc.conf.get(config.Tests.INJECT_SHUFFLE_FETCH_FAILURES_DOWNSTREAM_DELAY)
+    }
+    if (delay <= 0) return  // delay == 0 was already handled at submission time
+
+    val parentShuffleIds = stage.parents.collect {
+      case sms: ShuffleMapStage => sms.shuffleDep.shuffleId
+    }
+    parentShuffleIds.foreach { shuffleId =>
+      if (injectShuffleFetchFailuresPendingDelayedCorruption.containsKey(shuffleId)) {
+        val newCount = injectShuffleFetchFailuresDownstreamSuccessCount.merge(shuffleId, 1, _ + _)
+        if (newCount >= delay) {
+          val (mapId, originalLocation) =
+            injectShuffleFetchFailuresPendingDelayedCorruption.remove(shuffleId)
+          mapOutputTracker.updateMapOutput(
+            shuffleId, mapId, injectShuffleFetchFailuresInvalidBlockManagerId(originalLocation))
+          // Bump the epoch so any executor that already fetched this shuffle's statuses
+          // re-fetches them; updateMapOutput on its own only invalidates the driver-side
+          // serialized cache.
+          mapOutputTracker.incrementEpoch()
+          logInfo(s"Test injection: corrupted mapper-0 of shuffle $shuffleId after " +
+            s"$newCount downstream consumer successes")
+        }
+      }
+    }
+  }
+
+  /**
+   * For INJECT_SHUFFLE_FETCH_FAILURES_RESULT_STAGE_DELAY = 0: when a ResultStage is about to
+   * dispatch tasks, fire any pending mapper-0 corruption for its direct shuffle parents
+   * BEFORE result tasks start. This keeps the result stage at zero finished tasks when
+   * INJECT_SHUFFLE_FORCE_CHECKSUM_MISMATCH_ON_RECOMPUTE later triggers `rollbackSucceedingStages`,
+   * so the rollback path does not abort a partially-finished result stage.
+   */
+  private def maybePreemptiveCorruptionForResultStage(stage: Stage): Unit = {
+    if (!stage.isInstanceOf[ResultStage]) return
+    if (!sc.conf.get(config.Tests.INJECT_SHUFFLE_FETCH_FAILURES)) return
+    if (sc.conf.get(config.Tests.INJECT_SHUFFLE_FETCH_FAILURES_RESULT_STAGE_DELAY) > 0) return
+    if (injectShuffleFetchFailuresPendingDelayedCorruption.isEmpty) return
+
+    val parentShuffleIds = stage.parents.collect {
+      case sms: ShuffleMapStage => sms.shuffleDep.shuffleId
+    }
+    parentShuffleIds.foreach { shuffleId =>
+      if (injectShuffleFetchFailuresPendingDelayedCorruption.containsKey(shuffleId)) {
+        val (mapId, originalLocation) =
+          injectShuffleFetchFailuresPendingDelayedCorruption.remove(shuffleId)
+        mapOutputTracker.updateMapOutput(
+          shuffleId, mapId, injectShuffleFetchFailuresInvalidBlockManagerId(originalLocation))
+        // Bump the epoch so any executor that already fetched this shuffle's statuses
+        // re-fetches them; updateMapOutput on its own only invalidates the driver-side
+        // serialized cache.
+        mapOutputTracker.incrementEpoch()
+        logInfo(s"Test injection: corrupted mapper-0 of shuffle $shuffleId before result-stage " +
+          s"submission")
+      }
+    }
+  }
+
   private def configureShufflePushMergerLocations(stage: ShuffleMapStage): Unit = {
     if (stage.shuffleDep.getMergerLocs.nonEmpty) return
     val mergerLocs = sc.schedulerBackend.getShufflePushMergerLocations(
@@ -1596,6 +1830,10 @@ private[spark] class DAGScheduler(
   /** Called when stage's parents are available and we can now do its task. */
   private def submitMissingTasks(stage: Stage, jobId: Int): Unit = {
     logDebug("submitMissingTasks(" + stage + ")")
+
+    if (Utils.isTesting) {
+      maybePreemptiveCorruptionForResultStage(stage)
+    }
 
     // For statically indeterminate stages being retried, we trigger rollback BEFORE task
     // submission. This is more efficient than deferring to task completion because:
@@ -1830,6 +2068,11 @@ private[spark] class DAGScheduler(
             throw SparkCoreErrors.accessNonExistentAccumulatorError(id)
         }
         acc.merge(updates.asInstanceOf[AccumulatorV2[Any, Any]])
+        if (acc.isInstanceOf[LastAttemptAccumulator[_, _, _]]) {
+          acc.asInstanceOf[LastAttemptAccumulator[_, _, _]].mergeLastAttempt(
+            updates, stage.rdd, event.taskInfo,
+            task.stageId, task.stageAttemptId, task.localProperties)
+        }
         // To avoid UI cruft, ignore cases where value wasn't updated
         if (acc.name.isDefined && !updates.isZero) {
           stage.latestInfo.accumulables(id) = acc.toInfo(None, Some(acc.value))
@@ -2131,19 +2374,13 @@ private[spark] class DAGScheduler(
     }
 
     stage.failedAttemptIds.add(stage.latestInfo.attemptNumber())
-    val shouldAbortStage = stage.failedAttemptIds.size >= maxConsecutiveStageAttempts ||
-      disallowStageRetryForTest
+    val abortReason = stageAbortReason(stage, reason)
+    val shouldAbortStage = abortReason.isDefined
     markStageAsFinished(stage, Some(reason), willRetry = !shouldAbortStage)
 
     if (shouldAbortStage) {
-      val abortMessage = if (disallowStageRetryForTest) {
-        "Stage will not retry stage due to testing config. Most recent failure " +
-          s"reason: $reason"
-      } else {
-        s"$stage (${stage.name}) has failed the maximum allowable number of " +
-          s"times: $maxConsecutiveStageAttempts. Most recent failure reason: $reason"
-      }
-      abortStage(stage, s"rollback failed due to: $abortMessage", None)
+      abortStage(stage,
+        s"rollback failed due to: ${abortReason.get}", None)
     } else {
       // In case multiple task failures triggered for a single stage attempt, ensure we only
       // resubmit the failed stage once.
@@ -2152,13 +2389,7 @@ private[spark] class DAGScheduler(
       if (noResubmitEnqueued) {
         logInfo(log"Resubmitting ${MDC(FAILED_STAGE, stage)} " +
           log"(${MDC(FAILED_STAGE_NAME, stage.name)}) due to rollback.")
-        messageScheduler.schedule(
-          new Runnable {
-            override def run(): Unit = eventProcessLoop.post(ResubmitFailedStages)
-          },
-          DAGScheduler.RESUBMIT_TIMEOUT,
-          TimeUnit.MILLISECONDS
-        )
+        scheduleResubmit()
       }
     }
 
@@ -2240,6 +2471,10 @@ private[spark] class DAGScheduler(
           taskScheduler.notifyPartitionCompletion(stageId, task.partitionId)
         }
 
+        if (Utils.isTesting && !ignoreOldTaskAttempts) {
+          maybeApplyDelayedCorruptionForTest(stage)
+        }
+
         task match {
           case rt: ResultTask[_, _] =>
             // Cast to ResultStage here because it's part of the ResultTask
@@ -2311,8 +2546,15 @@ private[spark] class DAGScheduler(
                 // The epoch of the task is acceptable (i.e., the task was launched after the most
                 // recent failure we're aware of for the executor), so mark the task's output as
                 // available.
+                if (Utils.isTesting &&
+                    sc.conf.get(config.Tests.INJECT_SHUFFLE_FETCH_FAILURES) &&
+                    shouldCorruptShuffleOutputForTest(shuffleStage.shuffleDep.shuffleId, task)) {
+                  corruptShuffleOutputForTest(shuffleStage.shuffleDep.shuffleId, status)
+                }
                 val isChecksumMismatched = mapOutputTracker.registerMapOutput(
-                  shuffleStage.shuffleDep.shuffleId, smt.partitionId, status)
+                    shuffleStage.shuffleDep.shuffleId, smt.partitionId, status) ||
+                  (Utils.isTesting &&
+                    isForcedChecksumMismatchForTest(shuffleStage.shuffleDep.shuffleId, task))
                 if (isChecksumMismatched) {
                   shuffleStage.isChecksumMismatched = isChecksumMismatched
                   // Runtime detection of nondeterministic output via checksum mismatch.
@@ -2373,9 +2615,8 @@ private[spark] class DAGScheduler(
             failedStage.failedAttemptIds.add(task.stageAttemptId)
           }
 
-          val shouldAbortStage =
-            failedStage.failedAttemptIds.size >= maxConsecutiveStageAttempts ||
-            disallowStageRetryForTest
+          val abortReason = stageAbortReason(failedStage, failureMessage)
+          val shouldAbortStage = abortReason.isDefined
 
           // It is likely that we receive multiple FetchFailed for a single stage (because we have
           // multiple tasks running concurrently on different executors). In that case, it is
@@ -2436,14 +2677,7 @@ private[spark] class DAGScheduler(
           }
 
           if (shouldAbortStage) {
-            val abortMessage = if (disallowStageRetryForTest) {
-              "Fetch failure will not retry stage due to testing config"
-            } else {
-              s"$failedStage (${failedStage.name}) has failed the maximum allowable number of " +
-                s"times: $maxConsecutiveStageAttempts. Most recent failure reason:\n" +
-                failureMessage
-            }
-            abortStage(failedStage, abortMessage, None)
+            abortStage(failedStage, abortReason.get, None)
           } else { // update failedStages and make sure a ResubmitFailedStages event is enqueued
             // TODO: Cancel running tasks in the failed stage -- cf. SPARK-17064
             val noResubmitEnqueued = !failedStages.contains(failedStage)
@@ -2478,13 +2712,7 @@ private[spark] class DAGScheduler(
                 log"Resubmitting ${MDC(STAGE, mapStage)} " +
                 log"(${MDC(STAGE_NAME, mapStage.name)}) and ${MDC(FAILED_STAGE, failedStage)} " +
                 log"(${MDC(FAILED_STAGE_NAME, failedStage.name)}) due to fetch failure")
-              messageScheduler.schedule(
-                new Runnable {
-                  override def run(): Unit = eventProcessLoop.post(ResubmitFailedStages)
-                },
-                DAGScheduler.RESUBMIT_TIMEOUT,
-                TimeUnit.MILLISECONDS
-              )
+              scheduleResubmit()
             }
           }
 
@@ -2565,19 +2793,11 @@ private[spark] class DAGScheduler(
           failedStage.failedAttemptIds.add(task.stageAttemptId)
           // TODO Refactor the failure handling logic to combine similar code with that of
           // FetchFailed.
-          val shouldAbortStage =
-            failedStage.failedAttemptIds.size >= maxConsecutiveStageAttempts ||
-              disallowStageRetryForTest
+          val abortReason = stageAbortReason(failedStage, message)
+          val shouldAbortStage = abortReason.isDefined
 
           if (shouldAbortStage) {
-            val abortMessage = if (disallowStageRetryForTest) {
-              "Barrier stage will not retry stage due to testing config. Most recent failure " +
-                s"reason: $message"
-            } else {
-              s"$failedStage (${failedStage.name}) has failed the maximum allowable number of " +
-                s"times: $maxConsecutiveStageAttempts. Most recent failure reason: $message"
-            }
-            abortStage(failedStage, abortMessage, None)
+            abortStage(failedStage, abortReason.get, None)
           } else {
             failedStage match {
               case failedMapStage: ShuffleMapStage =>
@@ -2599,9 +2819,7 @@ private[spark] class DAGScheduler(
             if (noResubmitEnqueued) {
               logInfo(log"Resubmitting ${MDC(FAILED_STAGE, failedStage)} " +
                 log"(${MDC(FAILED_STAGE_NAME, failedStage.name)}) due to barrier stage failure.")
-              messageScheduler.schedule(new Runnable {
-                override def run(): Unit = eventProcessLoop.post(ResubmitFailedStages)
-              }, DAGScheduler.RESUBMIT_TIMEOUT, TimeUnit.MILLISECONDS)
+              scheduleResubmit()
             }
           }
         }
@@ -2618,7 +2836,7 @@ private[spark] class DAGScheduler(
       case TaskResultLost =>
         // Do nothing here; the TaskScheduler handles these failures and resubmits the task.
 
-      case _: ExecutorLostFailure | UnknownReason =>
+      case _: ExecutorLostFailure | _: ExecutorShutdownFailure | UnknownReason =>
         // Unrecognized failure - also do nothing. If the task fails repeatedly, the TaskScheduler
         // will abort the job.
     }
@@ -3374,31 +3592,24 @@ private[spark] class DAGScheduler(
     if (stage == target) {
       return true
     }
-    val visitedRdds = new HashSet[RDD[_]]
-    // We are manually maintaining a stack here to prevent StackOverflowError
-    // caused by recursively visiting
-    val waitingForVisit = new ListBuffer[RDD[_]]
-    waitingForVisit += stage.rdd
-    def visit(rdd: RDD[_]): Unit = {
-      if (!visitedRdds(rdd)) {
-        visitedRdds += rdd
+    !traverseRDDGraphUntil(stage.rdd) { (rdd, enqueue) =>
+      if (rdd == target.rdd) {
+        false
+      } else {
         for (dep <- rdd.dependencies) {
           dep match {
             case shufDep: ShuffleDependency[_, _, _] =>
               val mapStage = getOrCreateShuffleMapStage(shufDep, stage.firstJobId)
               if (!mapStage.isAvailable) {
-                waitingForVisit.prepend(mapStage.rdd)
+                enqueue(mapStage.rdd)
               }  // Otherwise there's no need to follow the dependency back
             case narrowDep: NarrowDependency[_] =>
-              waitingForVisit.prepend(narrowDep.rdd)
+              enqueue(narrowDep.rdd)
           }
         }
+        true
       }
     }
-    while (waitingForVisit.nonEmpty) {
-      visit(waitingForVisit.remove(0))
-    }
-    visitedRdds.contains(target.rdd)
   }
 
   /**

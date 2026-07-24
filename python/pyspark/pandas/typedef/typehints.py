@@ -18,13 +18,13 @@
 """
 Utilities to deal with types. This is mostly focused on python3.
 """
+
 import datetime
 import decimal
-import sys
 import typing
 from collections.abc import Iterable
 from inspect import isclass
-from typing import Any, Callable, Generic, List, Tuple, Union, Type, get_type_hints
+from typing import Any, Callable, Generic, List, Optional, Tuple, Union, Type, get_type_hints
 
 import numpy as np
 import pandas as pd
@@ -32,7 +32,6 @@ from pandas.api.types import CategoricalDtype, pandas_dtype
 from pandas.api.extensions import ExtensionDtype
 
 from pyspark.loose_version import LooseVersion
-
 
 extension_dtypes: Tuple[type, ...]
 try:
@@ -127,15 +126,15 @@ class UnknownType:
 
 
 class IndexNameTypeHolder:
-    name = None
-    tpe = None
-    short_name = "IndexNameType"
+    name: Optional[str] = None
+    tpe: Optional[Union[type, Dtype]] = None
+    short_name: str = "IndexNameType"
 
 
 class NameTypeHolder:
-    name = None
-    tpe = None
-    short_name = "NameType"
+    name: Optional[str] = None
+    tpe: Optional[Union[type, Dtype]] = None
+    short_name: str = "NameType"
 
 
 def as_spark_type(
@@ -150,18 +149,24 @@ def as_spark_type(
     - dictionaries of field_name -> type
     - Python3's typing system
     """
-    # For NumPy typing, NumPy version should be 1.21+
-    if LooseVersion(np.__version__) >= LooseVersion("1.21"):
-        if (
-            hasattr(tpe, "__origin__")
-            and tpe.__origin__ is np.ndarray
-            and hasattr(tpe, "__args__")
-            and len(tpe.__args__) > 1
-        ):
-            # numpy.typing.NDArray
-            return types.ArrayType(
-                as_spark_type(tpe.__args__[1].__args__[0], raise_error=raise_error)
-            )
+    if (
+        hasattr(tpe, "__origin__")
+        and tpe.__origin__ is np.ndarray
+        and hasattr(tpe, "__args__")
+        and len(tpe.__args__) > 1
+    ):
+        # numpy.typing.NDArray for numpy < 2.5
+        return types.ArrayType(as_spark_type(tpe.__args__[1].__args__[0], raise_error=raise_error))
+    elif (
+        hasattr(tpe, "__origin__")
+        and hasattr(tpe.__origin__, "__value__")
+        and getattr(tpe.__origin__.__value__, "__origin__", None) is np.ndarray
+        and hasattr(tpe, "__args__")
+        and len(tpe.__args__) > 0
+    ):
+        # numpy.typing.NDArray for numpy >= 2.5: a PEP 695 type alias whose __value__
+        # resolves to np.ndarray[shape, dtype[scalar]], with the scalar at __args__[0]
+        return types.ArrayType(as_spark_type(tpe.__args__[0], raise_error=raise_error))
 
     if isinstance(tpe, np.dtype) and tpe == np.dtype("object"):
         pass
@@ -170,7 +175,8 @@ def as_spark_type(
         return types.ArrayType(types.StringType())
     elif hasattr(tpe, "__origin__") and issubclass(tpe.__origin__, list):
         element_type = as_spark_type(
-            tpe.__args__[0], raise_error=raise_error  # type: ignore[union-attr]
+            tpe.__args__[0],  # type: ignore[union-attr]
+            raise_error=raise_error,
         )
         if element_type is None:
             return None
@@ -300,9 +306,15 @@ def spark_type_to_pandas_dtype(
     ):
         return np.dtype("object")
     elif isinstance(spark_type, types.DayTimeIntervalType):
-        return np.dtype("timedelta64[ns]")
+        if LooseVersion(pd.__version__) < "3.0.0":
+            return np.dtype("timedelta64[ns]")
+        else:
+            return np.dtype("timedelta64[us]")
     elif isinstance(spark_type, (types.TimestampType, types.TimestampNTZType)):
-        return np.dtype("datetime64[ns]")
+        if LooseVersion(pd.__version__) < "3.0.0":
+            return np.dtype("datetime64[ns]")
+        else:
+            return np.dtype("datetime64[us]")
     else:
         from pyspark.pandas.utils import default_session
 
@@ -319,14 +331,19 @@ def spark_type_to_pandas_dtype(
         )
 
 
-def handle_dtype_as_extension_dtype(tpe: Dtype) -> bool:
+def is_str_dtype(tpe: Dtype) -> bool:
     if LooseVersion(pd.__version__) < "3.0.0":
-        return isinstance(tpe, extension_dtypes)
-
+        return False
     if extension_object_dtypes_available:
-        if isinstance(tpe, StringDtype):
-            return tpe.na_value is pd.NA
-    return isinstance(tpe, extension_dtypes)
+        return isinstance(tpe, StringDtype) and tpe.na_value is np.nan
+    return False
+
+
+def handle_dtype_as_extension_dtype(tpe: Dtype) -> bool:
+    if is_str_dtype(tpe):
+        return False
+    else:
+        return isinstance(tpe, extension_dtypes)
 
 
 def pandas_on_spark_type(tpe: Union[str, type, Dtype]) -> Tuple[Dtype, types.DataType]:
@@ -620,7 +637,7 @@ def infer_return_type(f: Callable) -> Union[SeriesType, DataFrameType, ScalarTyp
 
     if hasattr(tpe, "__origin__") and issubclass(tpe.__origin__, SeriesType):
         tpe = tpe.__args__[0]
-        if issubclass(tpe, NameTypeHolder):
+        if isinstance(tpe, type) and issubclass(tpe, NameTypeHolder):
             tpe = tpe.tpe
         dtype, spark_type = pandas_on_spark_type(tpe)
         return SeriesType(dtype, spark_type)
@@ -648,9 +665,11 @@ def infer_return_type(f: Callable) -> Union[SeriesType, DataFrameType, ScalarTyp
                     InternalField(
                         dtype=index_dtype,
                         struct_field=types.StructField(
-                            name=index_name
-                            if index_name is not None
-                            else SPARK_INDEX_NAME_FORMAT(level),
+                            name=(
+                                index_name
+                                if index_name is not None
+                                else SPARK_INDEX_NAME_FORMAT(level)
+                            ),
                             dataType=index_spark_type,
                         ),
                     )
@@ -661,9 +680,11 @@ def infer_return_type(f: Callable) -> Union[SeriesType, DataFrameType, ScalarTyp
 
         data_dtypes, data_spark_types = zip(
             *(
-                pandas_on_spark_type(p.tpe)
-                if isclass(p) and issubclass(p, NameTypeHolder)
-                else pandas_on_spark_type(p)
+                (
+                    pandas_on_spark_type(p.tpe)
+                    if isclass(p) and issubclass(p, NameTypeHolder)
+                    else pandas_on_spark_type(p)
+                )
                 for p in data_parameters
             )
         )
@@ -710,9 +731,12 @@ def create_type_for_series_type(param: Any) -> Type[SeriesType]:
     new_class: Type[NameTypeHolder]
     if isinstance(param, ExtensionDtype):
         new_class = type(NameTypeHolder.short_name, (NameTypeHolder,), {})
-        new_class.tpe = param  # type: ignore[assignment]
+        new_class.tpe = param
     else:
-        new_class = param.type if isinstance(param, np.dtype) else param
+        if LooseVersion(pd.__version__) < "3.0.0":
+            new_class = param.type if isinstance(param, np.dtype) else param
+        else:
+            new_class = param
 
     return SeriesType[new_class]  # type: ignore[valid-type]
 
@@ -848,21 +872,16 @@ def _new_type_holders(
         isinstance(param, slice) and param.step is None and param.stop is not None
         for param in params
     )
-    if sys.version_info < (3, 11):
-        is_unnamed_params = all(
-            not isinstance(param, slice) and not isinstance(param, Iterable) for param in params
+    # PEP 646 changes `GenericAlias` instances into iterable ones at Python 3.11+
+    is_unnamed_params = all(
+        not isinstance(param, slice)
+        and (
+            not isinstance(param, Iterable)
+            or isinstance(param, typing.GenericAlias)  # type: ignore[attr-defined]
+            or isinstance(param, typing._GenericAlias)  # type: ignore[attr-defined]
         )
-    else:
-        # PEP 646 changes `GenericAlias` instances into iterable ones at Python 3.11
-        is_unnamed_params = all(
-            not isinstance(param, slice)
-            and (
-                not isinstance(param, Iterable)
-                or isinstance(param, typing.GenericAlias)  # type: ignore[attr-defined]
-                or isinstance(param, typing._GenericAlias)  # type: ignore[attr-defined]
-            )
-            for param in params
-        )
+        for param in params
+    )
 
     if is_named_params:
         # DataFrame["id": int, "A": int]
@@ -872,11 +891,16 @@ def _new_type_holders(
                 holder_clazz.short_name, (holder_clazz,), {}
             )
             new_param.name = param.start
-            if isinstance(param.stop, ExtensionDtype):
-                new_param.tpe = param.stop  # type: ignore[assignment]
+            if LooseVersion(pd.__version__) < "3.0.0":
+                if isinstance(param.stop, ExtensionDtype):
+                    new_param.tpe = param.stop
+                else:
+                    # When the given argument is a numpy's dtype instance.
+                    new_param.tpe = (
+                        param.stop.type if isinstance(param.stop, np.dtype) else param.stop
+                    )
             else:
-                # When the given argument is a numpy's dtype instance.
-                new_param.tpe = param.stop.type if isinstance(param.stop, np.dtype) else param.stop  # type: ignore[assignment]
+                new_param.tpe = param.stop
             new_params.append(new_param)
         return tuple(new_params)
     elif is_unnamed_params:
@@ -886,10 +910,13 @@ def _new_type_holders(
             new_type: Type[Union[NameTypeHolder, IndexNameTypeHolder]] = type(
                 holder_clazz.short_name, (holder_clazz,), {}
             )
-            if isinstance(param, ExtensionDtype):
-                new_type.tpe = param  # type: ignore[assignment]
+            if LooseVersion(pd.__version__) < "3.0.0":
+                if isinstance(param, ExtensionDtype):
+                    new_type.tpe = param
+                else:
+                    new_type.tpe = param.type if isinstance(param, np.dtype) else param
             else:
-                new_type.tpe = param.type if isinstance(param, np.dtype) else param  # type: ignore[assignment]
+                new_type.tpe = param
             new_types.append(new_type)
         return tuple(new_types)
     else:
@@ -917,7 +944,7 @@ def _test() -> None:
     import pyspark.pandas.typedef.typehints
 
     globs = pyspark.pandas.typedef.typehints.__dict__.copy()
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.pandas.typedef.typehints,
         globs=globs,
         optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE,

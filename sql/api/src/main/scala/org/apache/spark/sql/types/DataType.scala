@@ -27,7 +27,7 @@ import org.json4s.JsonAST.JValue
 import org.json4s.JsonDSL._
 import org.json4s.jackson.JsonMethods._
 
-import org.apache.spark.{SparkIllegalArgumentException, SparkThrowable}
+import org.apache.spark.{SparkClassNotFoundException, SparkIllegalArgumentException, SparkThrowable}
 import org.apache.spark.annotation.Stable
 import org.apache.spark.sql.catalyst.analysis.SqlApiAnalysis
 import org.apache.spark.sql.catalyst.parser.DataTypeParser
@@ -127,6 +127,8 @@ object DataType {
   private val CHAR_TYPE = """char\(\s*(\d+)\s*\)""".r
   private val VARCHAR_TYPE = """varchar\(\s*(\d+)\s*\)""".r
   private val STRING_WITH_COLLATION = """string\s+collate\s+(\w+)""".r
+  private val TIMESTAMP_LTZ_NANOS_TYPE = """timestamp_ltz\(\s*(\d+)\s*\)""".r
+  private val TIMESTAMP_NTZ_NANOS_TYPE = """timestamp_ntz\(\s*(\d+)\s*\)""".r
   private val GEOMETRY_TYPE = """geometry\(\s*([\w]+:-?[\w]+)\s*\)""".r
   private val GEOGRAPHY_TYPE_CRS = """geography\(\s*(\w+:-?\w+)\s*\)""".r
   private val GEOGRAPHY_TYPE_ALG = """geography\(\s*(\w+)\s*\)""".r
@@ -233,6 +235,46 @@ object DataType {
       case GEOGRAPHY_TYPE_CRS_ALG(crs, alg) => GeographyType(crs, alg)
       // For backwards compatibility, previously the type name of NullType is "null"
       case "null" => NullType
+      case TIMESTAMP_LTZ_NANOS_TYPE(precision) =>
+        val p =
+          try precision.toInt
+          catch {
+            case _: NumberFormatException =>
+              throw DataTypeErrors.invalidTimestampPrecisionError(precision, "TIMESTAMP_LTZ")
+          }
+        // Precision 6 (microseconds) maps to the GA type and is accepted regardless of the
+        // nanos timestamp types preview flag.
+        if (p == 6) {
+          TimestampType
+        } else if (p < TimestampLTZNanosType.MIN_PRECISION ||
+          p > TimestampLTZNanosType.MAX_PRECISION) {
+          // Reject out-of-range precisions before the feature-flag check so the error is always
+          // INVALID_TIMESTAMP_PRECISION, not FEATURE_NOT_ENABLED.
+          throw DataTypeErrors.invalidTimestampPrecisionError(precision, "TIMESTAMP_LTZ")
+        } else {
+          DataTypeErrors.checkTimestampNanosTypesEnabled()
+          TimestampLTZNanosType(p)
+        }
+      case TIMESTAMP_NTZ_NANOS_TYPE(precision) =>
+        val p =
+          try precision.toInt
+          catch {
+            case _: NumberFormatException =>
+              throw DataTypeErrors.invalidTimestampPrecisionError(precision, "TIMESTAMP_NTZ")
+          }
+        // Precision 6 (microseconds) maps to the GA type and is accepted regardless of the
+        // nanos timestamp types preview flag.
+        if (p == 6) {
+          TimestampNTZType
+        } else if (p < TimestampNTZNanosType.MIN_PRECISION ||
+          p > TimestampNTZNanosType.MAX_PRECISION) {
+          // Reject out-of-range precisions before the feature-flag check so the error is always
+          // INVALID_TIMESTAMP_PRECISION, not FEATURE_NOT_ENABLED.
+          throw DataTypeErrors.invalidTimestampPrecisionError(precision, "TIMESTAMP_NTZ")
+        } else {
+          DataTypeErrors.checkTimestampNanosTypesEnabled()
+          TimestampNTZNanosType(p)
+        }
       case "timestamp_ltz" => TimestampType
       case other =>
         otherTypes.getOrElse(
@@ -295,7 +337,28 @@ object DataType {
           ("pyClass", _),
           ("sqlType", _),
           ("type", JString("udt"))) =>
-      SparkClassUtils.classForName[UserDefinedType[_]](udtClass).getConstructor().newInstance()
+      if (!SqlApiConf.get.allowCreatingUDTFromString &&
+        !SqlApiConf.get.allowedDynamicUDTClasses.contains(udtClass)) {
+        throw DataTypeErrors.udtClassLoadingDisabledError(
+          udtClass,
+          SqlApiConf.get.allowedDynamicUDTClasses)
+      }
+      // Defense in depth: resolve the class without initializing it and verify that it really is a
+      // UserDefinedType subclass before constructing it.
+      val clazz =
+        try {
+          SparkClassUtils.classForName[UserDefinedType[_]](udtClass, initialize = false)
+        } catch {
+          case e: ClassNotFoundException =>
+            throw new SparkClassNotFoundException(
+              errorClass = "UDT_CLASS_NOT_FOUND.WITHOUT_USER_CLASS",
+              messageParameters = Map("udtClass" -> udtClass),
+              cause = e)
+        }
+      if (!classOf[UserDefinedType[_]].isAssignableFrom(clazz)) {
+        throw DataTypeErrors.udtClassNotUserDefinedTypeError(udtClass)
+      }
+      clazz.getConstructor().newInstance()
 
     // Python UDT
     case JSortedObject(

@@ -213,6 +213,11 @@ class BarrierTaskContext private[spark] (
     this
   }
 
+  override def addTaskInterruptListener(listener: TaskInterruptListener): this.type = {
+    taskContext.addTaskInterruptListener(listener)
+    this
+  }
+
   override def stageId(): Int = taskContext.stageId()
 
   override def stageAttemptNumber(): Int = taskContext.stageAttemptNumber()
@@ -289,6 +294,15 @@ class BarrierTaskContext private[spark] (
   override private[spark] def createResourceUninterruptibly[T <: Closeable](resourceBuilder: => T)
     : T = {
     taskContext.createResourceUninterruptibly(resourceBuilder)
+  }
+
+  override def addPostStatusUpdateListener(listener: PostStatusUpdateListener): TaskContext = {
+    taskContext.addPostStatusUpdateListener(listener)
+    this
+  }
+
+  override private[spark] def invokePostStatusUpdateListeners(): Unit = {
+    taskContext.invokePostStatusUpdateListeners()
   }
 }
 

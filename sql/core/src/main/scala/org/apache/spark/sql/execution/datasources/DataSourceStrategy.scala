@@ -163,8 +163,8 @@ object DataSourceAnalysis extends Rule[LogicalPlan] {
       CreateDataSourceTableAsSelectCommand(tableDesc, mode, query, query.output.map(_.name))
 
     case InsertIntoStatement(l @ LogicalRelationWithTable(_: InsertableRelation, _),
-        parts, _, query, overwrite, false, _, _)
-        if parts.isEmpty =>
+        parts, _, query, overwrite, false, _, replaceCriteriaOpt, _)
+        if parts.isEmpty && replaceCriteriaOpt.isEmpty =>
       InsertIntoDataSourceCommand(l, query, overwrite)
 
     case InsertIntoDir(_, storage, provider, query, overwrite)
@@ -176,8 +176,8 @@ object DataSourceAnalysis extends Rule[LogicalPlan] {
       InsertIntoDataSourceDirCommand(storage, provider.get, query, overwrite)
 
     case i @ InsertIntoStatement(l @ LogicalRelationWithTable(t: HadoopFsRelation, table),
-        parts, _, query, overwrite, _, _, _)
-        if query.resolved =>
+        parts, _, query, overwrite, _, _, replaceCriteriaOpt, _)
+        if query.resolved && replaceCriteriaOpt.isEmpty =>
       // If the InsertIntoTable command is for a partitioned HadoopFsRelation and
       // the user has specified static partitions, we add a Project operator on top of the query
       // to include those constant column values in the query result.
@@ -305,22 +305,22 @@ class FindDataSourceTable(sparkSession: SparkSession) extends Rule[LogicalPlan] 
       userSpecifiedSchema = Some(table.schema),
       options = dsOptions,
       catalogTable = Some(table),
-      userSpecifiedStreamingSourceName = Some(sourceIdentifyingName))
+      userSpecifiedStreamingSourceName = sourceIdentifyingName.toUserProvided)
     StreamingRelation(dataSource)
   }
 
 
   override def apply(plan: LogicalPlan): LogicalPlan = plan resolveOperators {
     case i @ InsertIntoStatement(UnresolvedCatalogRelation(tableMeta, options, false),
-        _, _, _, _, _, _, _) if DDLUtils.isDatasourceTable(tableMeta) =>
+        _, _, _, _, _, _, _, _) if DDLUtils.isDatasourceTable(tableMeta) =>
       i.copy(table = readDataSourceTable(tableMeta, options))
 
     case i @ InsertIntoStatement(UnresolvedCatalogRelation(tableMeta, _, false),
-        _, _, _, _, _, _, _) =>
+        _, _, _, _, _, _, _, _) =>
       i.copy(table = DDLUtils.readHiveTable(tableMeta))
 
     case append @ AppendData(
-        ExtractV2Table(V1Table(table: CatalogTable)), _, _, _, _, _) if !append.isByName =>
+        ExtractV2Table(V1Table(table: CatalogTable)), _, _, _, _, _, _) if !append.isByName =>
       InsertIntoStatement(UnresolvedCatalogRelation(table),
         table.partitionColumnNames.map(name => name -> None).toMap,
         Seq.empty, append.query, false, append.isByName)
@@ -866,6 +866,106 @@ object DataSourceStrategy
     }
 
     sortOrders.flatMap(translateSortOrder)
+  }
+
+  /**
+   * Expands struct equality predicates into additional field-level equality predicates
+   * suitable for data source pushdown. The original predicates are preserved (not replaced)
+   * so they serve as post-scan correctness filters.
+   *
+   * For `struct_col = struct_literal` or `struct_col <=> struct_literal`, generates:
+   *   GetStructField(struct_col, i) = literal_field_i
+   * for each non-null leaf field in the struct literal. Fields whose literal value is null
+   * are NOT decomposed because pushing `field = null` would incorrectly filter out rows
+   * (SQL `= null` is always false/null). Skipping null-valued fields is sound: the pushed
+   * predicates form a weaker (superset) filter, and the original struct predicate retained
+   * post-scan guarantees exact correctness.
+   *
+   * @param filters The original filter expressions.
+   * @param conf The active SQLConf.
+   * @return original filters ++ decomposed field-level equality filters.
+   */
+  protected[sql] def expandStructPredicatesForPushdown(
+      filters: Seq[Expression],
+      conf: SQLConf): Seq[Expression] = {
+    if (!conf.structPredicateDecomposeEnabled) {
+      return filters
+    }
+    val maxFields = conf.structPredicateDecomposeMaxFields
+    val additional = mutable.ArrayBuffer.empty[Expression]
+    filters.foreach {
+      case expressions.EqualTo(left, right) =>
+        decomposeStructEquality(left, right, maxFields).foreach(additional ++= _)
+      case expressions.EqualNullSafe(left, right) =>
+        decomposeStructEquality(left, right, maxFields).foreach(additional ++= _)
+      case _ =>
+    }
+    if (additional.isEmpty) filters else filters ++ additional
+  }
+
+  /**
+   * For a struct equality (either `=` or `<=>`), decomposes into field-level `EqualTo`
+   * predicates for non-null literal fields. Returns None if the predicate is not
+   * decomposable (not a struct equality against a foldable literal, or exceeds maxFields).
+   */
+  private def decomposeStructEquality(
+      left: Expression,
+      right: Expression,
+      maxFields: Int): Option[Seq[Expression]] = {
+    val (col, lit) = (left, right) match {
+      case (l, r) if r.foldable && r.dataType.isInstanceOf[StructType] &&
+        l.dataType.isInstanceOf[StructType] => (l, r)
+      case (l, r) if l.foldable && l.dataType.isInstanceOf[StructType] &&
+        r.dataType.isInstanceOf[StructType] => (r, l)
+      case _ => return None
+    }
+    val st = lit.dataType.asInstanceOf[StructType]
+    if (totalLeafFields(st) > maxFields) return None
+    val litValue = lit.eval(EmptyRow)
+    if (litValue == null) return None  // whole struct is null, nothing to push
+    val litRow = litValue.asInstanceOf[InternalRow]
+    val fieldPreds = extractFieldPredicates(col, litRow, st)
+    if (fieldPreds.isEmpty) None else Some(fieldPreds)
+  }
+
+  /**
+   * Recursively extracts field-level EqualTo predicates for all leaf (non-struct) fields
+   * whose literal value is non-null.
+   */
+  private def extractFieldPredicates(
+      col: Expression,
+      litRow: InternalRow,
+      st: StructType): Seq[Expression] = {
+    val buf = mutable.ArrayBuffer.empty[Expression]
+    st.fields.indices.foreach { i =>
+      val field = st.fields(i)
+      val fieldExpr = GetStructField(col, i)
+      field.dataType match {
+        case nested: StructType =>
+          if (!litRow.isNullAt(i)) {
+            val nestedRow = litRow.getStruct(i, nested.length)
+            buf ++= extractFieldPredicates(fieldExpr, nestedRow, nested)
+          }
+          // if litRow.isNullAt(i), skip entire nested struct (sound over-approximation)
+        case dt =>
+          if (!litRow.isNullAt(i)) {
+            val litVal = litRow.get(i, dt)
+            buf += expressions.EqualTo(fieldExpr, Literal(litVal, dt))
+          }
+          // null-valued field: do NOT push `field = null` (unsound)
+      }
+    }
+    buf.toSeq
+  }
+
+  /** Counts total leaf (non-struct) fields recursively. */
+  private def totalLeafFields(st: StructType): Int = {
+    st.fields.iterator.map { f =>
+      f.dataType match {
+        case s: StructType => totalLeafFields(s)
+        case _ => 1
+      }
+    }.sum
   }
 
   /**

@@ -38,7 +38,7 @@ import org.apache.spark.sql.connector.catalog.SupportsNamespaces.PROP_OWNER
 import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.StaticSQLConf.CATALOG_IMPLEMENTATION
-import org.apache.spark.sql.test.{SharedSparkSession, SQLTestUtils}
+import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
 import org.apache.spark.util.Utils
 
@@ -196,7 +196,7 @@ class InMemoryCatalogedDDLSuite extends DDLSuite with SharedSparkSession {
         exception = intercept[AnalysisException] {
           sql("CREATE TABLE t LIKE s USING org.apache.spark.sql.hive.orc")
         },
-        condition = "_LEGACY_ERROR_TEMP_1138",
+        condition = "ORC_DATA_SOURCE_REQUIRES_HIVE_SUPPORT",
         parameters = Map.empty
       )
     }
@@ -251,7 +251,7 @@ class InMemoryCatalogedDDLSuite extends DDLSuite with SharedSparkSession {
   }
 }
 
-trait DDLSuiteBase extends SQLTestUtils {
+trait DDLSuiteBase extends QueryTest {
 
   protected def isUsingHiveMetastore: Boolean = {
     spark.sparkContext.conf.get(CATALOG_IMPLEMENTATION) == "hive"
@@ -822,11 +822,11 @@ abstract class DDLSuite extends QueryTest with DDLSuiteBase {
         exception = intercept[AnalysisException] {
           sql("ALTER TABLE tab1 RENAME TO default.tab2")
         },
-        condition = "_LEGACY_ERROR_TEMP_1074",
+        condition = "RENAME_TEMP_VIEW_WITH_DATABASE",
         parameters = Map(
           "oldName" -> "`tab1`",
           "newName" -> "`default`.`tab2`",
-          "db" -> "default")
+          "db" -> "`default`")
       )
 
       val catalog = spark.sessionState.catalog
@@ -851,11 +851,11 @@ abstract class DDLSuite extends QueryTest with DDLSuiteBase {
         exception = intercept[AnalysisException] {
           sql("ALTER TABLE view1 RENAME TO default.tab2")
         },
-        condition = "_LEGACY_ERROR_TEMP_1074",
+        condition = "RENAME_TEMP_VIEW_WITH_DATABASE",
         parameters = Map(
           "oldName" -> "`view1`",
           "newName" -> "`default`.`tab2`",
-          "db" -> "default"))
+          "db" -> "`default`"))
 
       val catalog = spark.sessionState.catalog
       assert(catalog.listTables("default") == Seq(TableIdentifier("view1")))
@@ -1091,7 +1091,7 @@ abstract class DDLSuite extends QueryTest with DDLSuiteBase {
         "alternative" -> "DROP TABLE",
         "operation" -> "DROP VIEW",
         "foundType" -> "EXTERNAL",
-        "requiredType" -> "VIEW",
+        "requiredType" -> "VIEW or METRIC_VIEW",
         "objectName" -> "spark_catalog.dbx.tab1")
     )
   }
@@ -1121,27 +1121,35 @@ abstract class DDLSuite extends QueryTest with DDLSuiteBase {
   test("drop built-in function") {
     Seq("true", "false").foreach { caseSensitive =>
       withSQLConf(SQLConf.CASE_SENSITIVE.key -> caseSensitive) {
-        // partition to add already exists
         checkError(
           exception = intercept[AnalysisException] {
             sql("DROP TEMPORARY FUNCTION year")
           },
-          condition = "_LEGACY_ERROR_TEMP_1255",
-          parameters = Map("functionName" -> "year")
+          condition = "FORBIDDEN_OPERATION",
+          parameters = Map(
+            "statement" -> "DROP",
+            "objectType" -> "FUNCTION",
+            "objectName" -> "`year`")
         )
         checkError(
           exception = intercept[AnalysisException] {
             sql("DROP TEMPORARY FUNCTION YeAr")
           },
-          condition = "_LEGACY_ERROR_TEMP_1255",
-          parameters = Map("functionName" -> "YeAr")
+          condition = "FORBIDDEN_OPERATION",
+          parameters = Map(
+            "statement" -> "DROP",
+            "objectType" -> "FUNCTION",
+            "objectName" -> "`YeAr`")
         )
         checkError(
           exception = intercept[AnalysisException] {
             sql("DROP TEMPORARY FUNCTION `YeAr`")
           },
-          condition = "_LEGACY_ERROR_TEMP_1255",
-          parameters = Map("functionName" -> "YeAr")
+          condition = "FORBIDDEN_OPERATION",
+          parameters = Map(
+            "statement" -> "DROP",
+            "objectType" -> "FUNCTION",
+            "objectName" -> "`YeAr`")
         )
       }
     }
@@ -1196,6 +1204,12 @@ abstract class DDLSuite extends QueryTest with DDLSuiteBase {
       Row("Class: org.apache.spark.sql.catalyst.expressions.BitwiseXor") ::
         Row(
           """Extended Usage:
+            |    Arguments:
+            |      * expr1 - The first operand of the bitwise exclusive OR.
+            |        An expression that evaluates to an integral.
+            |      * expr2 - The second operand of the bitwise exclusive OR.
+            |        An expression that evaluates to an integral.
+            |  
             |    Examples:
             |      > SELECT 3 ^ 5;
             |       6
@@ -2226,7 +2240,7 @@ abstract class DDLSuite extends QueryTest with DDLSuiteBase {
     // TODO(SPARK-50244): ADD JAR is inside `sql()` thus isolated. This will break an existing Hive
     //  use case (one session adds JARs and another session uses them). After we sort out the Hive
     //  isolation issue we will decide if the next assert should be wrapped inside `withResources`.
-    spark.artifactManager.withResources {
+    spark.sessionState.artifactManager.withResources {
       assert(new File(SparkFiles.get(s"${directoryToAdd.getName}/${testFile.getName}")).exists())
     }
   }
@@ -2533,6 +2547,36 @@ abstract class DDLSuite extends QueryTest with DDLSuiteBase {
     )
   }
 
+  test("CREATE STREAMING TABLE without subquery cannot be directly executed") {
+    checkError(
+      exception = intercept[SparkUnsupportedOperationException] {
+        sql("CREATE STREAMING TABLE table1")
+      },
+      condition = "UNSUPPORTED_FEATURE.CREATE_PIPELINE_DATASET_QUERY_EXECUTION",
+      sqlState = "0A000",
+      parameters = Map("pipelineDatasetType" -> "STREAMING TABLE")
+    )
+  }
+
+  test("CREATE STREAMING TABLE FLOW AUTO CDC cannot be directly executed") {
+    withTable("cdc_src") {
+      sql("CREATE TABLE cdc_src AS SELECT 1 AS id, 1 AS ts")
+      checkError(
+        exception = intercept[SparkUnsupportedOperationException] {
+          sql(
+            """CREATE STREAMING TABLE table1
+              |FLOW AUTO CDC
+              |FROM STREAM(cdc_src)
+              |KEYS (id)
+              |SEQUENCE BY ts""".stripMargin)
+        },
+        condition = "UNSUPPORTED_FEATURE.CREATE_PIPELINE_DATASET_QUERY_EXECUTION",
+        sqlState = "0A000",
+        parameters = Map("pipelineDatasetType" -> "STREAMING TABLE")
+      )
+    }
+  }
+
   test(s"CREATE FLOW statement cannot be directly executed") {
     sql("CREATE TABLE table1 AS SELECT 1")
     sql("CREATE TABLE table2 AS SELECT 2")
@@ -2544,6 +2588,24 @@ abstract class DDLSuite extends QueryTest with DDLSuiteBase {
       sqlState = "0A000",
       parameters = Map.empty
     )
+  }
+
+  test("CREATE FLOW AS AUTO CDC cannot be directly executed") {
+    withTable("cdc_src") {
+      sql("CREATE TABLE cdc_src AS SELECT 1 AS id, 1 AS ts")
+      checkError(
+        exception = intercept[SparkUnsupportedOperationException] {
+          sql(
+            """CREATE FLOW f AS AUTO CDC INTO target
+              |FROM STREAM(cdc_src)
+              |KEYS (id)
+              |SEQUENCE BY ts""".stripMargin)
+        },
+        condition = "UNSUPPORTED_FEATURE.CREATE_FLOW_QUERY_EXECUTION",
+        sqlState = "0A000",
+        parameters = Map.empty
+      )
+    }
   }
 }
 

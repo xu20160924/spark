@@ -9,6 +9,7 @@ CreateDataSourceTableCommand `spark_catalog`.`default`.`test_change`, false
 DESC test_change
 -- !query analysis
 DescribeTableCommand `spark_catalog`.`default`.`test_change`, false, [col_name#x, data_type#x, comment#x]
++- ResolvedTable V2SessionCatalog(spark_catalog), default.test_change, V1Table(default.test_change), [a#x, b#x, c#x]
 
 
 -- !query
@@ -34,6 +35,7 @@ org.apache.spark.sql.catalyst.parser.ParseException
 DESC test_change
 -- !query analysis
 DescribeTableCommand `spark_catalog`.`default`.`test_change`, false, [col_name#x, data_type#x, comment#x]
++- ResolvedTable V2SessionCatalog(spark_catalog), default.test_change, V1Table(default.test_change), [a#x, b#x, c#x]
 
 
 -- !query
@@ -54,6 +56,7 @@ org.apache.spark.sql.AnalysisException
 DESC test_change
 -- !query analysis
 DescribeTableCommand `spark_catalog`.`default`.`test_change`, false, [col_name#x, data_type#x, comment#x]
++- ResolvedTable V2SessionCatalog(spark_catalog), default.test_change, V1Table(default.test_change), [a#x, b#x, c#x]
 
 
 -- !query
@@ -84,6 +87,7 @@ org.apache.spark.sql.AnalysisException
 DESC test_change
 -- !query analysis
 DescribeTableCommand `spark_catalog`.`default`.`test_change`, false, [col_name#x, data_type#x, comment#x]
++- ResolvedTable V2SessionCatalog(spark_catalog), default.test_change, V1Table(default.test_change), [a#x, b#x, c#x]
 
 
 -- !query
@@ -118,48 +122,51 @@ org.apache.spark.sql.AnalysisException
 DESC test_change
 -- !query analysis
 DescribeTableCommand `spark_catalog`.`default`.`test_change`, false, [col_name#x, data_type#x, comment#x]
++- ResolvedTable V2SessionCatalog(spark_catalog), default.test_change, V1Table(default.test_change), [a#x, b#x, c#x]
 
 
 -- !query
 ALTER TABLE test_change CHANGE a COMMENT 'this is column a'
 -- !query analysis
-AlterTableChangeColumnCommand `spark_catalog`.`default`.`test_change`, a, StructField(a,IntegerType,true)
+AlterTableChangeColumnCommand `spark_catalog`.`default`.`test_change`, a, StructField(a,IntegerType,true), false
 
 
 -- !query
 ALTER TABLE test_change CHANGE b COMMENT '#*02?`'
 -- !query analysis
-AlterTableChangeColumnCommand `spark_catalog`.`default`.`test_change`, b, StructField(b,StringType,true)
+AlterTableChangeColumnCommand `spark_catalog`.`default`.`test_change`, b, StructField(b,StringType,true), false
 
 
 -- !query
 ALTER TABLE test_change CHANGE c COMMENT ''
 -- !query analysis
-AlterTableChangeColumnCommand `spark_catalog`.`default`.`test_change`, c, StructField(c,IntegerType,true)
+AlterTableChangeColumnCommand `spark_catalog`.`default`.`test_change`, c, StructField(c,IntegerType,true), false
 
 
 -- !query
 DESC test_change
 -- !query analysis
 DescribeTableCommand `spark_catalog`.`default`.`test_change`, false, [col_name#x, data_type#x, comment#x]
++- ResolvedTable V2SessionCatalog(spark_catalog), default.test_change, V1Table(default.test_change), [a#x, b#x, c#x]
 
 
 -- !query
 ALTER TABLE test_change CHANGE a TYPE INT
 -- !query analysis
-AlterTableChangeColumnCommand `spark_catalog`.`default`.`test_change`, a, StructField(a,IntegerType,true)
+AlterTableChangeColumnCommand `spark_catalog`.`default`.`test_change`, a, StructField(a,IntegerType,true), false
 
 
 -- !query
 ALTER TABLE test_change CHANGE a COMMENT 'this is column a'
 -- !query analysis
-AlterTableChangeColumnCommand `spark_catalog`.`default`.`test_change`, a, StructField(a,IntegerType,true)
+AlterTableChangeColumnCommand `spark_catalog`.`default`.`test_change`, a, StructField(a,IntegerType,true), false
 
 
 -- !query
 DESC test_change
 -- !query analysis
 DescribeTableCommand `spark_catalog`.`default`.`test_change`, false, [col_name#x, data_type#x, comment#x]
++- ResolvedTable V2SessionCatalog(spark_catalog), default.test_change, V1Table(default.test_change), [a#x, b#x, c#x]
 
 
 -- !query
@@ -187,18 +194,20 @@ org.apache.spark.sql.AnalysisException
 DESC test_change
 -- !query analysis
 DescribeTableCommand `spark_catalog`.`default`.`test_change`, false, [col_name#x, data_type#x, comment#x]
++- ResolvedTable V2SessionCatalog(spark_catalog), default.test_change, V1Table(default.test_change), [a#x, b#x, c#x]
 
 
 -- !query
 ALTER TABLE test_change CHANGE A COMMENT 'case insensitivity'
 -- !query analysis
-AlterTableChangeColumnCommand `spark_catalog`.`default`.`test_change`, a, StructField(a,IntegerType,true)
+AlterTableChangeColumnCommand `spark_catalog`.`default`.`test_change`, a, StructField(a,IntegerType,true), false
 
 
 -- !query
 DESC test_change
 -- !query analysis
 DescribeTableCommand `spark_catalog`.`default`.`test_change`, false, [col_name#x, data_type#x, comment#x]
++- ResolvedTable V2SessionCatalog(spark_catalog), default.test_change, V1Table(default.test_change), [a#x, b#x, c#x]
 
 
 -- !query
@@ -269,4 +278,4 @@ DropTable false, false
 -- !query
 DROP VIEW global_temp.global_temp_view
 -- !query analysis
-DropTempViewCommand global_temp.global_temp_view
+DropTempViewCommand global_temp.global_temp_view, false

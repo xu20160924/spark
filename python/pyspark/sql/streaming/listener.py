@@ -64,7 +64,8 @@ class StreamingQueryListener(ABC):
     """
 
     def _set_spark_session(
-        self, session: "SparkSession"  # type: ignore[name-defined] # noqa: F821
+        self,
+        session: "SparkSession",  # type: ignore[name-defined] # noqa: F821
     ) -> None:
         if self.spark is None:
             self.spark = session
@@ -134,10 +135,8 @@ class StreamingQueryListener(ABC):
         if hasattr(self, "_jlistenerobj"):
             return self._jlistenerobj
 
-        self._jlistenerobj: "JavaObject" = (
-            SparkContext._jvm.PythonStreamingQueryListenerWrapper(  # type: ignore[union-attr]
-                JStreamingQueryListener(self)
-            )
+        self._jlistenerobj: "JavaObject" = SparkContext._jvm.PythonStreamingQueryListenerWrapper(  # type: ignore[union-attr]
+            JStreamingQueryListener(self)
         )
         return self._jlistenerobj
 
@@ -518,15 +517,17 @@ class StreamingQueryProgress(dict):
             sink=SinkProgress.fromJson(j["sink"]),
             numInputRows=j["numInputRows"] if "numInputRows" in j else None,
             inputRowsPerSecond=j["inputRowsPerSecond"] if "inputRowsPerSecond" in j else None,
-            processedRowsPerSecond=j["processedRowsPerSecond"]
-            if "processedRowsPerSecond" in j
-            else None,
-            observedMetrics={
-                k: Row(*row_dict.keys())(*row_dict.values())  # Assume no nested rows
-                for k, row_dict in j["observedMetrics"].items()
-            }
-            if "observedMetrics" in j
-            else {},
+            processedRowsPerSecond=(
+                j["processedRowsPerSecond"] if "processedRowsPerSecond" in j else None
+            ),
+            observedMetrics=(
+                {
+                    k: Row(*row_dict.keys())(*row_dict.values())  # Assume no nested rows
+                    for k, row_dict in j["observedMetrics"].items()
+                }
+                if "observedMetrics" in j
+                else {}
+            ),
         )
 
     @property
@@ -1114,6 +1115,7 @@ def _test() -> None:
     import sys
     import doctest
     import os
+    from pyspark.core.context import SparkContext
     from pyspark.sql import SparkSession
     import pyspark.sql.streaming.listener
     from py4j.protocol import Py4JError
@@ -1121,14 +1123,15 @@ def _test() -> None:
     os.chdir(os.environ["SPARK_HOME"])
 
     globs = pyspark.sql.streaming.listener.__dict__.copy()
+    sc = SparkContext("local[4]", "PythonTest")
     try:
         spark = SparkSession._getActiveSessionOrCreate()
     except Py4JError:
-        spark = SparkSession(sc)  # type: ignore[name-defined] # noqa: F821
+        spark = SparkSession(sc)
 
     globs["spark"] = spark
 
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.sql.streaming.listener,
         globs=globs,
     )

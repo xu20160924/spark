@@ -36,6 +36,7 @@ from pyspark.ml.param.shared import (
     HasCheckpointInterval,
     HasSolver,
     HasMaxBlockSizeInMB,
+    HasIntermediateStorageLevel,
     Param,
     Params,
     TypeConverters,
@@ -582,6 +583,7 @@ class _KMeansParams(
     HasWeightCol,
     HasSolver,
     HasMaxBlockSizeInMB,
+    HasIntermediateStorageLevel,
 ):
     """
     Params for :py:class:`KMeans` and :py:class:`KMeansModel`.
@@ -920,6 +922,13 @@ class KMeans(JavaEstimator[KMeansModel], _KMeansParams, JavaMLWritable, JavaMLRe
         Sets the value of :py:attr:`maxBlockSizeInMB`.
         """
         return self._set(maxBlockSizeInMB=value)
+
+    @since("5.0.0")
+    def setIntermediateStorageLevel(self, value: str) -> "KMeans":
+        """
+        Sets the value of :py:attr:`intermediateStorageLevel`.
+        """
+        return self._set(intermediateStorageLevel=value)
 
 
 @inherit_doc
@@ -1270,8 +1279,7 @@ class _LDAParams(HasMaxIter, HasFeaturesCol, HasSeed, HasCheckpointInterval):
     optimizer: Param[str] = Param(
         Params._dummy(),
         "optimizer",
-        "Optimizer or inference algorithm used to estimate the LDA model.  "
-        "Supported: online, em",
+        "Optimizer or inference algorithm used to estimate the LDA model.  Supported: online, em",
         typeConverter=TypeConverters.toString,
     )
     learningOffset: Param[float] = Param(
@@ -2193,7 +2201,7 @@ if __name__ == "__main__":
     temp_path = tempfile.mkdtemp()
     globs["temp_path"] = temp_path
     try:
-        (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
+        failure_count, test_count = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
         spark.stop()
     finally:
         from shutil import rmtree

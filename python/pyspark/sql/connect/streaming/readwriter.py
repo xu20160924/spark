@@ -14,10 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-from pyspark.sql.connect.utils import check_dependencies
-
-check_dependencies(__name__)
-
 import json
 import re
 import sys
@@ -25,7 +21,13 @@ import pickle
 from typing import cast, overload, Callable, Dict, List, Optional, TYPE_CHECKING, Union
 
 from pyspark.serializers import CloudPickleSerializer
-from pyspark.sql.connect.plan import DataSource, LogicalPlan, Read, WriteStreamOperation
+from pyspark.sql.connect.plan import (
+    DataSource,
+    LogicalPlan,
+    Read,
+    RelationChanges,
+    WriteStreamOperation,
+)
 import pyspark.sql.connect.proto as pb2
 from pyspark.sql.connect.readwriter import OptionUtils, to_str
 from pyspark.sql.connect.streaming.query import StreamingQuery
@@ -36,7 +38,12 @@ from pyspark.sql.streaming.readwriter import (
 from pyspark.sql.streaming.listener import QueryStartedEvent
 from pyspark.sql.connect.utils import get_python_ver
 from pyspark.sql.types import Row, StructType
-from pyspark.errors import PySparkTypeError, PySparkValueError, PySparkPicklingError
+from pyspark.errors import (
+    AnalysisException,
+    PySparkTypeError,
+    PySparkValueError,
+    PySparkPicklingError,
+)
 
 if TYPE_CHECKING:
     from pyspark.sql.connect.session import SparkSession
@@ -71,14 +78,20 @@ class DataStreamReader(OptionUtils):
             self._schema = schema
         else:
             raise PySparkTypeError(
-                errorClass="NOT_STR_OR_STRUCT",
-                messageParameters={"arg_name": "schema", "arg_type": type(schema).__name__},
+                errorClass="NOT_EXPECTED_TYPE",
+                messageParameters={
+                    "arg_name": "schema",
+                    "expected_type": "str or struct type",
+                    "arg_type": type(schema).__name__,
+                },
             )
         return self
 
     schema.__doc__ = PySparkDataStreamReader.schema.__doc__
 
     def option(self, key: str, value: "OptionalPrimitiveType") -> "DataStreamReader":
+        if value is None:
+            return self
         self._options[key] = str(value)
         return self
 
@@ -94,9 +107,10 @@ class DataStreamReader(OptionUtils):
     def name(self, source_name: str) -> "DataStreamReader":
         if not isinstance(source_name, str):
             raise PySparkTypeError(
-                errorClass="NOT_STR",
+                errorClass="NOT_EXPECTED_TYPE",
                 messageParameters={
                     "arg_name": "source_name",
+                    "expected_type": "str",
                     "arg_type": type(source_name).__name__,
                 },
             )
@@ -125,7 +139,7 @@ class DataStreamReader(OptionUtils):
         if schema is not None:
             self.schema(schema)
         self.options(**options)
-        if path is not None and (type(path) != str or len(path.strip()) == 0):
+        if path is not None and (not isinstance(path, str) or len(path.strip()) == 0):
             raise PySparkValueError(
                 errorClass="VALUE_NOT_NON_EMPTY_STR",
                 messageParameters={"arg_name": "path", "arg_value": str(path)},
@@ -198,8 +212,12 @@ class DataStreamReader(OptionUtils):
             return self.load(path=path, format="json")
         else:
             raise PySparkTypeError(
-                errorClass="NOT_STR",
-                messageParameters={"arg_name": "path", "arg_type": type(path).__name__},
+                errorClass="NOT_EXPECTED_TYPE",
+                messageParameters={
+                    "arg_name": "path",
+                    "expected_type": "str",
+                    "arg_type": type(path).__name__,
+                },
             )
 
     json.__doc__ = PySparkDataStreamReader.json.__doc__
@@ -220,8 +238,12 @@ class DataStreamReader(OptionUtils):
             return self.load(path=path, format="orc")
         else:
             raise PySparkTypeError(
-                errorClass="NOT_STR",
-                messageParameters={"arg_name": "path", "arg_type": type(path).__name__},
+                errorClass="NOT_EXPECTED_TYPE",
+                messageParameters={
+                    "arg_name": "path",
+                    "expected_type": "str",
+                    "arg_type": type(path).__name__,
+                },
             )
 
     orc.__doc__ = PySparkDataStreamReader.orc.__doc__
@@ -253,8 +275,12 @@ class DataStreamReader(OptionUtils):
             return self.load(path=path, format="parquet")
         else:
             raise PySparkTypeError(
-                errorClass="NOT_STR",
-                messageParameters={"arg_name": "path", "arg_type": type(path).__name__},
+                errorClass="NOT_EXPECTED_TYPE",
+                messageParameters={
+                    "arg_name": "path",
+                    "expected_type": "str",
+                    "arg_type": type(path).__name__,
+                },
             )
 
     parquet.__doc__ = PySparkDataStreamReader.parquet.__doc__
@@ -277,8 +303,12 @@ class DataStreamReader(OptionUtils):
             return self.load(path=path, format="text")
         else:
             raise PySparkTypeError(
-                errorClass="NOT_STR",
-                messageParameters={"arg_name": "path", "arg_type": type(path).__name__},
+                errorClass="NOT_EXPECTED_TYPE",
+                messageParameters={
+                    "arg_name": "path",
+                    "expected_type": "str",
+                    "arg_type": type(path).__name__,
+                },
             )
 
     text.__doc__ = PySparkDataStreamReader.text.__doc__
@@ -353,8 +383,12 @@ class DataStreamReader(OptionUtils):
             return self.load(path=path, format="csv")
         else:
             raise PySparkTypeError(
-                errorClass="NOT_STR",
-                messageParameters={"arg_name": "path", "arg_type": type(path).__name__},
+                errorClass="NOT_EXPECTED_TYPE",
+                messageParameters={
+                    "arg_name": "path",
+                    "expected_type": "str",
+                    "arg_type": type(path).__name__,
+                },
             )
 
     csv.__doc__ = PySparkDataStreamReader.csv.__doc__
@@ -407,8 +441,12 @@ class DataStreamReader(OptionUtils):
             return self.load(path=path, format="xml")
         else:
             raise PySparkTypeError(
-                errorClass="NOT_STR",
-                messageParameters={"arg_name": "path", "arg_type": type(path).__name__},
+                errorClass="NOT_EXPECTED_TYPE",
+                messageParameters={
+                    "arg_name": "path",
+                    "expected_type": "str",
+                    "arg_type": type(path).__name__,
+                },
             )
 
     xml.__doc__ = PySparkDataStreamReader.xml.__doc__
@@ -417,6 +455,17 @@ class DataStreamReader(OptionUtils):
         return self._df(Read(tableName, self._options, is_streaming=True))
 
     table.__doc__ = PySparkDataStreamReader.table.__doc__
+
+    def changes(self, tableName: str) -> "DataFrame":
+        if self._schema:
+            raise AnalysisException(
+                "User specified schema not supported with `changes`.",
+                errorClass="_LEGACY_ERROR_TEMP_1189",
+                messageParameters={"operation": "changes"},
+            )
+        return self._df(RelationChanges(tableName, self._options, is_streaming=True))
+
+    changes.__doc__ = PySparkDataStreamReader.changes.__doc__
 
 
 DataStreamReader.__doc__ = PySparkDataStreamReader.__doc__
@@ -441,6 +490,8 @@ class DataStreamWriter:
     format.__doc__ = PySparkDataStreamWriter.format.__doc__
 
     def option(self, key: str, value: "OptionalPrimitiveType") -> "DataStreamWriter":
+        if value is None:
+            return self
         self._write_proto.options[key] = cast(str, to_str(value))
         return self
 
@@ -454,12 +505,10 @@ class DataStreamWriter:
     options.__doc__ = PySparkDataStreamWriter.options.__doc__
 
     @overload
-    def partitionBy(self, *cols: str) -> "DataStreamWriter":
-        ...
+    def partitionBy(self, *cols: str) -> "DataStreamWriter": ...
 
     @overload
-    def partitionBy(self, __cols: List[str]) -> "DataStreamWriter":
-        ...
+    def partitionBy(self, __cols: List[str]) -> "DataStreamWriter": ...
 
     def partitionBy(self, *cols: str) -> "DataStreamWriter":  # type: ignore[misc]
         if len(cols) == 1 and isinstance(cols[0], (list, tuple)):
@@ -473,12 +522,10 @@ class DataStreamWriter:
     partitionBy.__doc__ = PySparkDataStreamWriter.partitionBy.__doc__
 
     @overload
-    def clusterBy(self, *cols: str) -> "DataStreamWriter":
-        ...
+    def clusterBy(self, *cols: str) -> "DataStreamWriter": ...
 
     @overload
-    def clusterBy(self, __cols: List[str]) -> "DataStreamWriter":
-        ...
+    def clusterBy(self, __cols: List[str]) -> "DataStreamWriter": ...
 
     def clusterBy(self, *cols: str) -> "DataStreamWriter":  # type: ignore[misc]
         if len(cols) == 1 and isinstance(cols[0], (list, tuple)):
@@ -492,7 +539,7 @@ class DataStreamWriter:
     clusterBy.__doc__ = PySparkDataStreamWriter.clusterBy.__doc__
 
     def queryName(self, queryName: str) -> "DataStreamWriter":
-        if not queryName or type(queryName) != str or len(queryName.strip()) == 0:
+        if not queryName or not isinstance(queryName, str) or len(queryName.strip()) == 0:
             raise PySparkValueError(
                 errorClass="VALUE_NOT_NON_EMPTY_STR",
                 messageParameters={"arg_name": "queryName", "arg_value": str(queryName)},
@@ -503,24 +550,19 @@ class DataStreamWriter:
     queryName.__doc__ = PySparkDataStreamWriter.queryName.__doc__
 
     @overload
-    def trigger(self, *, processingTime: str) -> "DataStreamWriter":
-        ...
+    def trigger(self, *, processingTime: str) -> "DataStreamWriter": ...
 
     @overload
-    def trigger(self, *, once: bool) -> "DataStreamWriter":
-        ...
+    def trigger(self, *, once: bool) -> "DataStreamWriter": ...
 
     @overload
-    def trigger(self, *, continuous: str) -> "DataStreamWriter":
-        ...
+    def trigger(self, *, continuous: str) -> "DataStreamWriter": ...
 
     @overload
-    def trigger(self, *, availableNow: bool) -> "DataStreamWriter":
-        ...
+    def trigger(self, *, availableNow: bool) -> "DataStreamWriter": ...
 
     @overload
-    def trigger(self, *, realTime: str) -> "DataStreamWriter":
-        ...
+    def trigger(self, *, realTime: str) -> "DataStreamWriter": ...
 
     def trigger(
         self,
@@ -545,7 +587,7 @@ class DataStreamWriter:
             )
 
         if processingTime is not None:
-            if type(processingTime) != str or len(processingTime.strip()) == 0:
+            if not isinstance(processingTime, str) or len(processingTime.strip()) == 0:
                 raise PySparkValueError(
                     errorClass="VALUE_NOT_NON_EMPTY_STR",
                     messageParameters={
@@ -558,13 +600,13 @@ class DataStreamWriter:
         elif once is not None:
             if once is not True:
                 raise PySparkValueError(
-                    errorClass="VALUE_NOT_TRUE",
-                    messageParameters={"arg_name": "once", "arg_value": str(once)},
+                    errorClass="VALUE_NOT_ALLOWED",
+                    messageParameters={"arg_name": "once", "allowed_values": "[True]"},
                 )
             self._write_proto.once = True
 
         elif continuous is not None:
-            if type(continuous) != str or len(continuous.strip()) == 0:
+            if not isinstance(continuous, str) or len(continuous.strip()) == 0:
                 raise PySparkValueError(
                     errorClass="VALUE_NOT_NON_EMPTY_STR",
                     messageParameters={"arg_name": "continuous", "arg_value": str(continuous)},
@@ -572,7 +614,7 @@ class DataStreamWriter:
             self._write_proto.continuous_checkpoint_interval = continuous.strip()
 
         elif realTime is not None:
-            if type(realTime) != str or len(realTime.strip()) == 0:
+            if not isinstance(realTime, str) or len(realTime.strip()) == 0:
                 raise PySparkValueError(
                     errorClass="VALUE_NOT_NON_EMPTY_STR",
                     messageParameters={"arg_name": "realTime", "arg_value": str(realTime)},
@@ -582,8 +624,8 @@ class DataStreamWriter:
         else:
             if availableNow is not True:
                 raise PySparkValueError(
-                    errorClass="VALUE_NOT_TRUE",
-                    messageParameters={"arg_name": "availableNow", "arg_value": str(availableNow)},
+                    errorClass="VALUE_NOT_ALLOWED",
+                    messageParameters={"arg_name": "availableNow", "allowed_values": "[True]"},
                 )
             self._write_proto.available_now = True
 
@@ -592,12 +634,10 @@ class DataStreamWriter:
     trigger.__doc__ = PySparkDataStreamWriter.trigger.__doc__
 
     @overload
-    def foreach(self, f: Callable[[Row], None]) -> "DataStreamWriter":
-        ...
+    def foreach(self, f: Callable[[Row], None]) -> "DataStreamWriter": ...
 
     @overload
-    def foreach(self, f: "SupportsProcess") -> "DataStreamWriter":
-        ...
+    def foreach(self, f: "SupportsProcess") -> "DataStreamWriter": ...
 
     def foreach(self, f: Union[Callable[[Row], None], "SupportsProcess"]) -> "DataStreamWriter":
         from pyspark.serializers import CPickleSerializer, AutoBatchedSerializer
@@ -660,7 +700,7 @@ class DataStreamWriter:
             self._write_proto.table_name = tableName
 
         cmd = self._write_stream.command(self._session.client)
-        (_, properties, _) = self._session.client.execute_command(cmd)
+        _, properties, _ = self._session.client.execute_command(cmd)
 
         start_result = cast(
             pb2.WriteStreamOperationStartResult, properties["write_stream_operation_start_result"]
@@ -740,7 +780,7 @@ def _test() -> None:
         .getOrCreate()
     )
 
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.sql.connect.streaming.readwriter,
         globs=globs,
         optionflags=doctest.ELLIPSIS

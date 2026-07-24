@@ -28,7 +28,7 @@ import io.fabric8.kubernetes.client.{KubernetesClient, KubernetesClientException
 import io.fabric8.kubernetes.client.dsl.PodResource
 import org.mockito.{Mock, MockitoAnnotations}
 import org.mockito.ArgumentMatchers.{any, anyString, eq => meq}
-import org.mockito.Mockito.{never, times, verify, when}
+import org.mockito.Mockito.{clearInvocations, never, times, verify, when}
 import org.mockito.invocation.InvocationOnMock
 import org.mockito.stubbing.Answer
 import org.scalatest.BeforeAndAfter
@@ -895,11 +895,28 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
       " namespace default"))
   }
 
+  test("SPARK-58113: wait for driver readiness by default") {
+    // The allocator in `before` was started with the default conf.
+    verify(driverPodOperations, times(1)).waitUntilReady(any(), any())
+  }
+
+  test("SPARK-58113: skip driver readiness wait when publishNotReadyAddresses is enabled") {
+    clearInvocations(driverPodOperations)
+    val confWithPublishNotReady = conf.clone()
+      .set(KUBERNETES_DRIVER_SERVICE_PUBLISH_NOT_READY_ADDRESSES, true)
+    val podsAllocator = new ExecutorPodsAllocator(
+      confWithPublishNotReady, secMgr, executorBuilder, kubernetesClient, snapshotsStore,
+      waitForExecutorPodsClock)
+    podsAllocator.setExecutorPodsLifecycleManager(lifecycleManager)
+    podsAllocator.start(TEST_SPARK_APP_ID, schedulerBackend)
+    verify(driverPodOperations, never()).waitUntilReady(any(), any())
+  }
+
   test("SPARK-39688: getReusablePVCs should handle accounts with no PVC permission") {
     val getReusablePVCs =
       PrivateMethod[mutable.Buffer[PersistentVolumeClaim]](Symbol("getReusablePVCs"))
     when(persistentVolumeClaimList.getItems).thenThrow(new KubernetesClientException("Error"))
-    podsAllocatorUnderTest invokePrivate getReusablePVCs("appId", Seq.empty[String])
+    podsAllocatorUnderTest invokePrivate getReusablePVCs("appId", Set.empty[String])
   }
 
   test("SPARK-41388: getReusablePVCs should ignore recently created PVCs in the previous batch") {
@@ -914,7 +931,8 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     pvc2.getMetadata.setCreationTimestamp(now.toString)
 
     when(persistentVolumeClaimList.getItems).thenReturn(Seq(pvc1, pvc2).asJava)
-    val reusablePVCs = podsAllocatorUnderTest invokePrivate getReusablePVCs("appId", Seq.empty)
+    val reusablePVCs =
+      podsAllocatorUnderTest invokePrivate getReusablePVCs("appId", Set.empty[String])
     assert(reusablePVCs.size == 1)
     assert(reusablePVCs.head.getMetadata.getName == "pvc-1")
   }
@@ -1079,5 +1097,13 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
 
     // Verify no pods were created since all attempts failed
     assert(podsAllocatorUnderTest.invokePrivate(numOutstandingPods).get() == 0)
+  }
+
+  test("SPARK-55639: setRecoveryMode should not change recovery mode if it is already false") {
+    val newConf = conf.clone.set(KUBERNETES_ALLOCATION_RECOVERY_MODE_ENABLED, false)
+    val podsAllocator = new ExecutorPodsAllocator(newConf, secMgr, executorBuilder,
+      kubernetesClient, snapshotsStore, waitForExecutorPodsClock)
+    podsAllocator.setRecoveryMode()
+    assert(!newConf.get(KUBERNETES_ALLOCATION_RECOVERY_MODE_ENABLED).get)
   }
 }

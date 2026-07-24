@@ -102,9 +102,11 @@ class TypeHintTestsMixin:
             inferred.dtypes,
             [
                 np.float64,
-                np.str_
-                if LooseVersion(pd.__version__) < LooseVersion("3.0.0")
-                else pd.StringDtype(na_value=np.nan),
+                (
+                    np.str_
+                    if LooseVersion(pd.__version__) < LooseVersion("3.0.0")
+                    else pd.StringDtype(na_value=np.nan)
+                ),
             ],
         )
         self.assertEqual(inferred.spark_type, expected)
@@ -133,9 +135,11 @@ class TypeHintTestsMixin:
             inferred.dtypes,
             [
                 np.float64,
-                np.str_
-                if LooseVersion(pd.__version__) < LooseVersion("3.0.0")
-                else pd.StringDtype(na_value=np.nan),
+                (
+                    np.str_
+                    if LooseVersion(pd.__version__) < LooseVersion("3.0.0")
+                    else pd.StringDtype(na_value=np.nan)
+                ),
             ],
         )
         self.assertEqual(inferred.spark_type, expected)
@@ -192,9 +196,11 @@ class TypeHintTestsMixin:
             inferred.dtypes,
             [
                 np.float64,
-                np.str_
-                if LooseVersion(pd.__version__) < LooseVersion("3.0.0")
-                else pd.StringDtype(na_value=np.nan),
+                (
+                    np.str_
+                    if LooseVersion(pd.__version__) < LooseVersion("3.0.0")
+                    else pd.StringDtype(na_value=np.nan)
+                ),
             ],
         )
         self.assertEqual(inferred.spark_type, expected)
@@ -352,16 +358,25 @@ class TypeHintTestsMixin:
             # string
             np.str_: (np.str_, StringType()),
             str: (
-                np.str_
-                if LooseVersion(pd.__version__) < LooseVersion("3.0.0")
-                else pd.StringDtype(na_value=np.nan),
+                (
+                    np.str_
+                    if LooseVersion(pd.__version__) < LooseVersion("3.0.0")
+                    else pd.StringDtype(na_value=np.nan)
+                ),
                 StringType(),
             ),
             # bool
             bool: (np.bool_, BooleanType()),
             # datetime
             np.datetime64: (np.datetime64, TimestampType()),
-            datetime.datetime: (np.dtype("datetime64[ns]"), TimestampType()),
+            datetime.datetime: (
+                (
+                    np.dtype("datetime64[ns]")
+                    if LooseVersion(pd.__version__) < LooseVersion("3.0.0")
+                    else np.dtype("datetime64[us]")
+                ),
+                TimestampType(),
+            ),
             # DateType
             datetime.date: (np.dtype("object"), DateType()),
             # DecimalType
@@ -392,17 +407,15 @@ class TypeHintTestsMixin:
                 (np.dtype("object"), ArrayType(spark_type)),
             )
 
-            # For NumPy typing, NumPy version should be 1.21+
-            if LooseVersion(np.__version__) >= LooseVersion("1.21"):
-                import numpy.typing as ntp
+            import numpy.typing as ntp
 
-                self.assertEqual(
-                    as_spark_type(ntp.NDArray[numpy_or_python_type]), ArrayType(spark_type)
-                )
-                self.assertEqual(
-                    pandas_on_spark_type(ntp.NDArray[numpy_or_python_type]),
-                    (np.dtype("object"), ArrayType(spark_type)),
-                )
+            self.assertEqual(
+                as_spark_type(ntp.NDArray[numpy_or_python_type]), ArrayType(spark_type)
+            )
+            self.assertEqual(
+                pandas_on_spark_type(ntp.NDArray[numpy_or_python_type]),
+                (np.dtype("object"), ArrayType(spark_type)),
+            )
 
         with self.assertRaisesRegex(TypeError, "Type uint64 was not understood."):
             as_spark_type(np.dtype("uint64"))

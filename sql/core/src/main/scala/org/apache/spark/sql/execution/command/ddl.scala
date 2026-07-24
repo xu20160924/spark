@@ -41,7 +41,7 @@ import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
 import org.apache.spark.sql.catalyst.util.ResolveDefaultColumnsUtils.CURRENT_DEFAULT_COLUMN_METADATA_KEY
 import org.apache.spark.sql.catalyst.util.TypeUtils.toSQLId
 import org.apache.spark.sql.classic.ClassicConversions.castToImpl
-import org.apache.spark.sql.connector.catalog.{CatalogV2Util, Identifier, TableCatalog}
+import org.apache.spark.sql.connector.catalog.{CatalogManager, CatalogV2Util, Identifier, TableCatalog, TableChange}
 import org.apache.spark.sql.connector.catalog.CatalogManager.SESSION_CATALOG_NAME
 import org.apache.spark.sql.connector.catalog.SupportsNamespaces._
 import org.apache.spark.sql.errors.QueryCompilationErrors
@@ -232,7 +232,8 @@ case class DropTableCommand(
       // If the command DROP VIEW is to drop a table or DROP TABLE is to drop a view
       // issue an exception.
       catalog.getTableMetadata(tableName).tableType match {
-        case CatalogTableType.VIEW if !isView =>
+        // Both VIEW and METRIC_VIEW are conceptually views and must be dropped via DROP VIEW.
+        case t if CatalogTable.isViewLike(t) && !isView =>
           throw QueryCompilationErrors.wrongCommandForObjectTypeError(
             operation = "DROP TABLE",
             requiredType = s"${CatalogTableType.EXTERNAL.name} or ${CatalogTableType.MANAGED.name}",
@@ -240,10 +241,11 @@ case class DropTableCommand(
             foundType = catalog.getTableMetadata(tableName).tableType.name,
             alternative = "DROP VIEW"
           )
-        case o if o != CatalogTableType.VIEW && isView =>
+        case o if !CatalogTable.isViewLike(o) && isView =>
           throw QueryCompilationErrors.wrongCommandForObjectTypeError(
             operation = "DROP VIEW",
-            requiredType = CatalogTableType.VIEW.name,
+            requiredType =
+              s"${CatalogTableType.VIEW.name} or ${CatalogTableType.METRIC_VIEW.name}",
             objectName = catalog.getTableMetadata(tableName).qualifiedName,
             foundType = o.name,
             alternative = "DROP TABLE"
@@ -269,21 +271,35 @@ case class DropTableCommand(
   }
 }
 
-case class DropTempViewCommand(ident: Identifier) extends LeafRunnableCommand {
+case class DropTempViewCommand(ident: Identifier, ifExists: Boolean = false)
+    extends LeafRunnableCommand {
   override def run(sparkSession: SparkSession): Seq[Row] = {
-    assert(ident.namespace().isEmpty || ident.namespace().length == 1)
+    // namespace: empty (unqualified), 1 part (session or global_temp), or 2 parts (system.session)
+    val ns = ident.namespace()
+    assert(ns.isEmpty || ns.length == 1 ||
+      (ns.length == 2 &&
+        ns(0).equalsIgnoreCase(CatalogManager.SYSTEM_CATALOG_NAME) &&
+        ns(1).equalsIgnoreCase(CatalogManager.SESSION_NAMESPACE)))
     val nameParts = (ident.namespace() :+ ident.name()).toImmutableArraySeq
     val catalog = sparkSession.sessionState.catalog
-    catalog.getRawLocalOrGlobalTempView(nameParts).foreach { view =>
-      val hasViewText = view.tableMeta.viewText.isDefined
-      sparkSession.sharedState.cacheManager.uncacheTableOrView(
-        sparkSession, nameParts, cascade = hasViewText)
-      view.refresh()
-      if (ident.namespace().isEmpty) {
-        catalog.dropTempView(ident.name())
-      } else {
-        catalog.dropGlobalTempView(ident.name())
-      }
+    catalog.getRawLocalOrGlobalTempView(nameParts) match {
+      case Some(view) =>
+        val hasViewText = view.tableMeta.viewText.isDefined
+        sparkSession.sharedState.cacheManager.uncacheTableOrView(
+          sparkSession, nameParts, cascade = hasViewText)
+        view.refresh()
+        if (ident.namespace().isEmpty) {
+          catalog.dropTempView(ident.name())
+        } else if (ident.namespace().length == 1 &&
+            catalog.isGlobalTempViewDB(ident.namespace().head)) {
+          catalog.dropGlobalTempView(ident.name())
+        } else {
+          // session, or system.session qualified -> local temp view
+          catalog.dropTempView(ident.name())
+        }
+      case None if !ifExists =>
+        throw QueryCompilationErrors.noSuchTableError(nameParts)
+      case None => ()
     }
     Seq.empty[Row]
   }
@@ -365,7 +381,8 @@ case class AlterTableUnsetPropertiesCommand(
 case class AlterTableChangeColumnCommand(
     tableName: TableIdentifier,
     columnName: String,
-    newColumn: StructField) extends LeafRunnableCommand {
+    newColumn: StructField,
+    dropComment: Boolean = false) extends LeafRunnableCommand {
 
   // TODO: support change column name/dataType/metadata/position.
   override def run(sparkSession: SparkSession): Seq[Row] = {
@@ -404,9 +421,15 @@ case class AlterTableChangeColumnCommand(
 
     val newDataSchema = table.dataSchema.fields.map { field =>
       if (field.name == originColumn.name) {
-        // Create a new column from the origin column with the new type and new comment.
-        val withNewTypeAndComment: StructField =
-          addComment(withNewType(field, newColumn.dataType), newColumn.getComment())
+        // Create a new column from the origin column with the new type and new comment. When
+        // `dropComment` is set (COMMENT ON COLUMN ... IS NULL), the comment is removed entirely
+        // rather than kept or set to an empty string.
+        val typedField = withNewType(field, newColumn.dataType)
+        val withNewTypeAndComment: StructField = if (dropComment) {
+          typedField.clearComment()
+        } else {
+          addComment(typedField, newColumn.getComment())
+        }
         // Create a new column from the origin column with the new current default value.
         // The default value is already validated by ResolveSessionCatalog, so we just need
         // to copy the CURRENT_DEFAULT metadata. Note: we preserve the original EXISTS_DEFAULT
@@ -470,6 +493,42 @@ case class AlterTableChangeColumnCommand(
   // are allowed.
   private def canEvolveType(from: StructField, to: StructField): Boolean = {
     DataType.equalsIgnoreCompatibleCollation(from.dataType, to.dataType, checkComplexTypes = false)
+  }
+}
+
+/**
+ * A command to set or remove comments on one or more columns of a table, including nested fields.
+ * Used for the multi-column and nested-field forms of `COMMENT ON TABLE ... COLUMN (...)` on the
+ * session catalog, which the single-column [[AlterTableChangeColumnCommand]] cannot express. Only
+ * `UpdateColumnComment` changes are expected here; the comments are applied to the data schema via
+ * [[CatalogV2Util.applySchemaChanges]].
+ */
+case class AlterTableChangeColumnCommentsCommand(
+    tableName: TableIdentifier,
+    changes: Seq[TableChange]) extends LeafRunnableCommand {
+
+  override def run(sparkSession: SparkSession): Seq[Row] = {
+    val catalog = sparkSession.sessionState.catalog
+    catalog.refreshTable(tableName)
+    val table = catalog.getTableRawMetadata(tableName)
+    val resolver = sparkSession.sessionState.conf.resolver
+    DDLUtils.verifyAlterTableType(catalog, table, isView = false)
+
+    // Comments on partition columns are not supported by this path.
+    changes.foreach {
+      case c: TableChange.UpdateColumnComment =>
+        val topLevel = c.fieldNames.head
+        if (table.partitionColumnNames.exists(resolver(topLevel, _))) {
+          throw QueryCompilationErrors.cannotAlterPartitionColumn(table.qualifiedName, topLevel)
+        }
+      case _ =>
+    }
+
+    val newDataSchema = CatalogV2Util.applySchemaChanges(
+      table.dataSchema, changes, table.provider, "ALTER TABLE")
+    catalog.alterTableDataSchema(tableName, newDataSchema)
+
+    Seq.empty[Row]
   }
 }
 
@@ -1073,11 +1132,11 @@ object DDLUtils extends Logging {
       isView: Boolean): Unit = {
     if (!catalog.isTempView(tableMetadata.identifier)) {
       tableMetadata.tableType match {
-        case CatalogTableType.VIEW if !isView =>
+        case t if CatalogTable.isViewLike(t) && !isView =>
           throw QueryCompilationErrors.cannotAlterViewWithAlterTableError(
             viewName = tableMetadata.identifier.table
           )
-        case o if o != CatalogTableType.VIEW && isView =>
+        case o if !CatalogTable.isViewLike(o) && isView =>
           throw QueryCompilationErrors.cannotAlterTableWithAlterViewError(
             tableName = tableMetadata.identifier.table
           )

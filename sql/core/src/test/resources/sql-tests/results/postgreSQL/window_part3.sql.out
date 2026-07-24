@@ -319,7 +319,8 @@ struct<>
 -- !query output
 org.apache.spark.sql.AnalysisException
 {
-  "errorClass" : "_LEGACY_ERROR_TEMP_1034",
+  "errorClass" : "WINDOW_FUNCTION_NOT_ALLOWED_IN_CLAUSE",
+  "sqlState" : "42601",
   "messageParameters" : {
     "clauseName" : "WHERE"
   }
@@ -336,7 +337,8 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
   "errorClass" : "UNSUPPORTED_EXPR_FOR_OPERATOR",
   "sqlState" : "42K0E",
   "messageParameters" : {
-    "invalidExprSqls" : "\"row_number() OVER (ORDER BY salary ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)\""
+    "invalidExprSqls" : "\"row_number() OVER (ORDER BY salary ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)\"",
+    "operator" : "Join"
   },
   "queryContext" : [ {
     "objectType" : "",
@@ -358,7 +360,8 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
   "errorClass" : "UNSUPPORTED_EXPR_FOR_OPERATOR",
   "sqlState" : "42K0E",
   "messageParameters" : {
-    "invalidExprSqls" : "\"RANK() OVER (ORDER BY 1 ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)\""
+    "invalidExprSqls" : "\"RANK() OVER (ORDER BY 1 ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)\"",
+    "operator" : "Aggregate"
   },
   "queryContext" : [ {
     "objectType" : "",
@@ -380,7 +383,7 @@ org.apache.spark.sql.catalyst.parser.ParseException
   "errorClass" : "PARSE_SYNTAX_ERROR",
   "sqlState" : "42601",
   "messageParameters" : {
-    "error" : "'BY'",
+    "error" : "'('",
     "hint" : ""
   }
 }
@@ -393,7 +396,8 @@ struct<>
 -- !query output
 org.apache.spark.sql.AnalysisException
 {
-  "errorClass" : "_LEGACY_ERROR_TEMP_1034",
+  "errorClass" : "WINDOW_FUNCTION_NOT_ALLOWED_IN_CLAUSE",
+  "sqlState" : "42601",
   "messageParameters" : {
     "clauseName" : "WHERE"
   }
@@ -407,7 +411,8 @@ struct<>
 -- !query output
 org.apache.spark.sql.AnalysisException
 {
-  "errorClass" : "_LEGACY_ERROR_TEMP_1034",
+  "errorClass" : "WINDOW_FUNCTION_NOT_ALLOWED_IN_CLAUSE",
+  "sqlState" : "42601",
   "messageParameters" : {
     "clauseName" : "WHERE"
   }
@@ -437,11 +442,10 @@ struct<>
 -- !query output
 org.apache.spark.sql.AnalysisException
 {
-  "errorClass" : "UNRESOLVED_ROUTINE",
-  "sqlState" : "42883",
+  "errorClass" : "NOT_A_SCALAR_FUNCTION",
+  "sqlState" : "42887",
   "messageParameters" : {
-    "routineName" : "`range`",
-    "searchPath" : "[`system`.`builtin`, `system`.`session`, `spark_catalog`.`default`]"
+    "functionName" : "`range`"
   },
   "queryContext" : [ {
     "objectType" : "",

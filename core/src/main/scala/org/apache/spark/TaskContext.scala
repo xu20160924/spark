@@ -27,7 +27,7 @@ import org.apache.spark.metrics.source.Source
 import org.apache.spark.resource.ResourceInformation
 import org.apache.spark.scheduler.Task
 import org.apache.spark.shuffle.FetchFailedException
-import org.apache.spark.util.{AccumulatorV2, TaskCompletionListener, TaskFailureListener}
+import org.apache.spark.util.{AccumulatorV2, PostStatusUpdateListener, TaskCompletionListener, TaskFailureListener, TaskInterruptListener}
 
 
 object TaskContext {
@@ -168,6 +168,49 @@ abstract class TaskContext extends Serializable {
       override def onTaskFailure(context: TaskContext, error: Throwable): Unit = f(context, error)
     })
   }
+
+  /**
+   * Adds a listener to be executed when the task is interrupted.
+   *
+   * Adding a listener to an already interrupted task will result in that listener being called
+   * immediately.
+   *
+   * There are no ordering guarantees for task interrupt listeners. Listeners are guaranteed to
+   * execute sequentially with other task completion, failure, or interrupt listeners. Listeners may
+   * be invoked concurrently with the task itself.
+   *
+   * Exceptions thrown by the listener will mark the task as failed; they are not propagated from
+   * `markInterrupted` (for example when interruption is delivered on the executor kill thread).
+   */
+  def addTaskInterruptListener(listener: TaskInterruptListener): TaskContext
+
+  /**
+   * Adds a listener to be executed when the task is interrupted (Scala closure form).
+   * Behavior matches `addTaskInterruptListener` with TaskInterruptListener.
+   */
+  def addTaskInterruptListener(f: (TaskContext, String) => Unit): TaskContext = {
+    addTaskInterruptListener(new TaskInterruptListener {
+      override def onTaskInterrupted(context: TaskContext, reason: String): Unit =
+        f(context, reason)
+    })
+  }
+
+  /**
+   * Adds a listener to be invoked after the task's status update has been sent to the driver.
+   * This is useful for operations that should only begin after the driver has been notified
+   * of the task's result. For example, push-based shuffle block push can use this to
+   * ensure the driver processes the task result before any push data reaches the merger,
+   * avoiding stale data being merged without detection.
+   *
+   * The callback runs on the same executor thread that sends the status update.
+   */
+  private[spark] def addPostStatusUpdateListener(listener: PostStatusUpdateListener): TaskContext
+
+  /**
+   * Invokes all registered post-status-update listeners. Called by Executor after sending
+   * the task's status update to the driver.
+   */
+  private[spark] def invokePostStatusUpdateListeners(): Unit
 
   /** Runs a task with this context, ensuring failure and completion listeners get triggered. */
   private[spark] def runTaskWithListeners[T](task: Task[T]): T = {

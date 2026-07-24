@@ -17,11 +17,19 @@
 
 package org.apache.spark.sql.pipelines.graph
 
+import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 
 import org.apache.spark.SparkThrowable
-import org.apache.spark.sql.{AnalysisException, SQLContext}
-import org.apache.spark.sql.connector.catalog.{CatalogV2Util, Identifier, TableCatalog}
+import org.apache.spark.sql.{AnalysisException, Row, SQLContext}
+import org.apache.spark.sql.connector.catalog.{
+  CatalogV2Util,
+  Identifier,
+  InMemoryTableCatalog,
+  Table => V2Table,
+  TableCatalog,
+  TableChange
+}
 import org.apache.spark.sql.connector.expressions.{ClusterByTransform, Expressions, FieldReference}
 import org.apache.spark.sql.execution.streaming.runtime.MemoryStream
 import org.apache.spark.sql.pipelines.graph.DatasetManager.TableMaterializationException
@@ -37,9 +45,9 @@ class DefaultMaterializeTablesSuite extends MaterializeTablesSuite with SharedSp
  * tables are written with the appropriate schemas.
  */
 abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
+  import testImplicits._
+
   test("basic") {
-    val session = spark
-    import session.implicits._
 
     materializeGraph(
       new TestGraphRegistrationContext(spark) {
@@ -123,8 +131,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("multiple") {
-    val session = spark
-    import session.implicits._
 
     materializeGraph(
       new TestGraphRegistrationContext(spark) {
@@ -161,8 +167,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("temporary views don't get materialized") {
-    val session = spark
-    import session.implicits._
 
     materializeGraph(
       new TestGraphRegistrationContext(spark) {
@@ -238,8 +242,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("schema matches existing table schema") {
-    val session = spark
-    import session.implicits._
 
     sql(s"CREATE TABLE ${TestGraphRegistrationContext.DEFAULT_DATABASE}.t2(x INT)")
     val catalog = spark.sessionState.catalogManager.currentCatalog.asInstanceOf[TableCatalog]
@@ -267,9 +269,7 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("invalid schema merge") {
-    val session = spark
     implicit val sqlCtx: SQLContext = spark.sqlContext
-    import session.implicits._
 
     val streamInts = MemoryStream[Int]
     streamInts.addData(1, 2)
@@ -298,8 +298,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("table materialized with specified schema, even if different from inferred") {
-    val session = spark
-    import session.implicits._
 
     sql(s"CREATE TABLE ${TestGraphRegistrationContext.DEFAULT_DATABASE}.t4(x INT)")
     val catalog = spark.sessionState.catalogManager.currentCatalog.asInstanceOf[TableCatalog]
@@ -337,8 +335,7 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("specified schema incompatible with existing table") {
-    val session = spark
-    import session.implicits._
+    implicit val sqlCtx: SQLContext = spark.sqlContext
 
     sql(s"CREATE TABLE ${TestGraphRegistrationContext.DEFAULT_DATABASE}.t6(x BOOLEAN)")
     val catalog = spark.sessionState.catalogManager.currentCatalog.asInstanceOf[TableCatalog]
@@ -383,8 +380,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("partition columns with user schema") {
-    val session = spark
-    import session.implicits._
 
     materializeGraph(
       new TestGraphRegistrationContext(spark) {
@@ -413,8 +408,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("specifying partition column with existing partitioned table") {
-    val session = spark
-    import session.implicits._
 
     sql(
       s"CREATE TABLE ${TestGraphRegistrationContext.DEFAULT_DATABASE}.t7(x BOOLEAN, y INT) " +
@@ -480,8 +473,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("specifying partition column different from existing partitioned table") {
-    val session = spark
-    import session.implicits._
 
     sql(
       s"CREATE TABLE ${TestGraphRegistrationContext.DEFAULT_DATABASE}.t8(x BOOLEAN, y INT) " +
@@ -545,8 +536,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("Invalid table properties error during table materialization") {
-    val session = spark
-    import session.implicits._
 
     // Invalid pipelines property
     val graph1 =
@@ -585,9 +574,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
     test(
       s"Complete tables should not evolve schema - isFullRefresh = $isFullRefresh"
     ) {
-      val session = spark
-      import session.implicits._
-
       val rawGraph =
         new TestGraphRegistrationContext(spark) {
           registerView("a", query = dfFlowFunc(Seq((1, 2), (2, 3)).toDF("x", "y")))
@@ -643,9 +629,7 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
     test(
       s"Streaming tables should evolve schema only if not full refresh = $isFullRefresh"
     ) {
-      val session = spark
       implicit val sqlCtx: SQLContext = spark.sqlContext
-      import session.implicits._
 
       val streamInts = MemoryStream[Int]
       streamInts.addData(1 until 5: _*)
@@ -712,8 +696,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   test(
     "materialize only selected tables"
   ) {
-    val session = spark
-    import session.implicits._
 
     val graph = new TestGraphRegistrationContext(spark) {
       registerTable("a", query = Option(dfFlowFunc(Seq((1, 2), (2, 3)).toDF("x", "y"))))
@@ -759,8 +741,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("tables with arrays and maps") {
-    val session = spark
-    import session.implicits._
 
     val rawGraph =
       new TestGraphRegistrationContext(spark) {
@@ -855,8 +835,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("materializing no tables doesn't throw") {
-    val session = spark
-    import session.implicits._
 
     val graph1 =
       new DataflowGraph(flows = Seq.empty, tables = Seq.empty, views = Seq.empty, sinks = Seq.empty)
@@ -886,8 +864,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("cluster columns with user schema") {
-    val session = spark
-    import session.implicits._
 
     materializeGraph(
       new TestGraphRegistrationContext(spark) {
@@ -923,8 +899,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("specifying cluster column with existing clustered table") {
-    val session = spark
-    import session.implicits._
 
     materializeGraph(
       new TestGraphRegistrationContext(spark) {
@@ -979,8 +953,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("specifying cluster column different from existing clustered table") {
-    val session = spark
-    import session.implicits._
 
     materializeGraph(
       new TestGraphRegistrationContext(spark) {
@@ -1018,8 +990,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("cluster columns only (no partitioning)") {
-    val session = spark
-    import session.implicits._
 
     materializeGraph(
       new TestGraphRegistrationContext(spark) {
@@ -1057,8 +1027,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("materialized view with cluster columns") {
-    val session = spark
-    import session.implicits._
 
     materializeGraph(
       new TestGraphRegistrationContext(spark) {
@@ -1088,8 +1056,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("partition and cluster columns together should fail") {
-    val session = spark
-    import session.implicits._
 
     val ex = intercept[TableMaterializationException] {
       materializeGraph(
@@ -1110,8 +1076,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("cluster column that doesn't exist in table schema should fail") {
-    val session = spark
-    import session.implicits._
 
     val ex = intercept[TableMaterializationException] {
       materializeGraph(
@@ -1126,5 +1090,154 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
       )
     }
     assert(ex.cause.isInstanceOf[AnalysisException])
+  }
+
+  // =============== Table evolution in catalog tests ===============
+
+  private val recordingCatalogName = "recording_cat"
+  private val recordingNamespace = "rec_ns"
+
+  /**
+   * Registers [[RecordingInMemoryTableCatalog]] under `recordingCatalogName`, creates
+   * `recordingNamespace`, runs `body`, then tears the registration back down.
+   */
+  private def withRecordingCatalog(body: => Unit): Unit = {
+    spark.conf.set(
+      s"spark.sql.catalog.$recordingCatalogName",
+      classOf[RecordingInMemoryTableCatalog].getName
+    )
+    try {
+      spark.sql(s"CREATE NAMESPACE IF NOT EXISTS $recordingCatalogName.$recordingNamespace")
+      body
+    } finally {
+      spark.sessionState.catalogManager.reset()
+      spark.sessionState.conf.unsetConf(s"spark.sql.catalog.$recordingCatalogName")
+    }
+  }
+
+  /**
+   * Materializes a single streaming table under the recording catalog/namespace with the given
+   * schema and properties.
+   */
+  private def materializeStreamingTable(
+      name: String,
+      schema: StructType,
+      properties: Map[String, String]): Unit = {
+    // All nulls dummy row, compatible with any schema type
+    val row = Row.fromSeq(Seq.fill(schema.length)(null))
+    val df = spark.createDataFrame(spark.sparkContext.parallelize(Seq(row)), schema)
+    materializeGraph(
+      new TestGraphRegistrationContext(spark) {
+        registerTable(
+          name,
+          query = Option(dfFlowFunc(df)),
+          specifiedSchema = Option(schema),
+          properties = properties,
+          catalog = Option(recordingCatalogName),
+          database = Option(recordingNamespace)
+        )
+      }.resolveToDataflowGraph(),
+      storageRoot = storageRoot
+    )
+  }
+
+  private def recordingCatalog: RecordingInMemoryTableCatalog =
+    spark.sessionState.catalogManager
+      .catalog(recordingCatalogName)
+      .asInstanceOf[RecordingInMemoryTableCatalog]
+
+  private def loadTableFromRecordingCatalog(name: String): V2Table = {
+    val catalog = spark.sessionState.catalogManager
+      .catalog(recordingCatalogName)
+      .asInstanceOf[TableCatalog]
+    catalog.loadTable(Identifier.of(Array(recordingNamespace), name))
+  }
+
+  test("re-materializing an unchanged table does not issue an alterTable") {
+    withRecordingCatalog {
+      val schema = new StructType().add("id", IntegerType).add("value", StringType)
+      val props = Map("p.a" -> "1", "p.b" -> "2")
+      // Creating the table issues no alter, and re-materializing the unchanged table is a no-op,
+      // so no alter is ever recorded.
+      materializeStreamingTable("t", schema, props)
+      assert(recordingCatalog.recordedAlters.isEmpty)
+      materializeStreamingTable("t", schema, props)
+      assert(recordingCatalog.recordedAlters.isEmpty)
+    }
+  }
+
+  test("re-materializing with changed/new properties issues an alterTable that sets them") {
+    withRecordingCatalog {
+      val schema = new StructType().add("id", IntegerType).add("value", StringType)
+      // Creating the table issues no alter; re-materializing with changed/added properties issues
+      // exactly one alter that sets them.
+      materializeStreamingTable("t", schema, Map("p.a" -> "1"))
+      assert(recordingCatalog.recordedAlters.isEmpty)
+      materializeStreamingTable("t", schema, Map("p.a" -> "2", "p.new" -> "n"))
+      assert(recordingCatalog.recordedAlters.size == 1)
+
+      val changes = recordingCatalog.recordedAlters.flatten
+      assert(changes.forall(_.isInstanceOf[TableChange.SetProperty]))
+      val set = changes.collect {
+        case s: TableChange.SetProperty => s.property() -> s.value()
+      }.toMap
+      assert(set == Map("p.a" -> "2", "p.new" -> "n"))
+
+      val table = loadTableFromRecordingCatalog("t")
+      assert(table.properties().get("p.a") == "2")
+      assert(table.properties().get("p.new") == "n")
+    }
+  }
+
+  test("re-materializing with an added column issues an alterTable") {
+    withRecordingCatalog {
+      // Creating the table issues no alter; re-materializing with an added column issues exactly
+      // one alter that adds it.
+      materializeStreamingTable("t", new StructType().add("id", IntegerType), Map("p.a" -> "1"))
+      assert(recordingCatalog.recordedAlters.isEmpty)
+      materializeStreamingTable(
+        "t",
+        new StructType().add("id", IntegerType).add("value", StringType),
+        Map("p.a" -> "1")
+      )
+      assert(recordingCatalog.recordedAlters.size == 1)
+
+      val changes = recordingCatalog.recordedAlters.flatten
+      assert(changes.exists(_.isInstanceOf[TableChange.AddColumn]))
+
+      assert(
+        loadTableFromRecordingCatalog("t").columns() sameElements
+          CatalogV2Util.structTypeToV2Columns(
+            new StructType().add("id", IntegerType).add("value", StringType)
+          )
+      )
+    }
+  }
+
+  test("re-materializing with a dropped property neither removes it nor issues an alterTable") {
+    withRecordingCatalog {
+      val schema = new StructType().add("id", IntegerType)
+      // This test locks in the current buggy behavior where dropped properties do not materialize
+      // against the catalog table entity. See SPARK-57670.
+      materializeStreamingTable("t", schema, Map("p.keep" -> "v", "p.stale" -> "old"))
+      assert(recordingCatalog.recordedAlters.isEmpty)
+      materializeStreamingTable("t", schema, Map("p.keep" -> "v"))
+      assert(recordingCatalog.recordedAlters.isEmpty)
+
+      assert(loadTableFromRecordingCatalog("t").properties().get("p.stale") == "old")
+    }
+  }
+}
+
+/**
+ * An [[InMemoryTableCatalog]] that records every `alterTable` invocation while still applying it,
+ * so tests can assert whether materialization issued an alter or skipped it as a no-op.
+ */
+class RecordingInMemoryTableCatalog extends InMemoryTableCatalog {
+  val recordedAlters: mutable.ArrayBuffer[Seq[TableChange]] = mutable.ArrayBuffer.empty
+
+  override def alterTable(ident: Identifier, changes: TableChange*): V2Table = {
+    recordedAlters += changes.toSeq
+    super.alterTable(ident, changes: _*)
   }
 }

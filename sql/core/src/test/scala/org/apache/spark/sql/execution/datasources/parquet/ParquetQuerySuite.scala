@@ -30,6 +30,7 @@ import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.{InternalRow, TableIdentifier}
 import org.apache.spark.sql.catalyst.expressions.SpecificInternalRow
 import org.apache.spark.sql.catalyst.util.ArrayData
+import org.apache.spark.sql.classic
 import org.apache.spark.sql.execution.FileSourceScanExec
 import org.apache.spark.sql.execution.datasources.{SchemaColumnConvertNotSupportedException, SQLHadoopMapReduceCommitProtocol}
 import org.apache.spark.sql.execution.datasources.parquet.TestingUDT._
@@ -37,14 +38,15 @@ import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
 import org.apache.spark.sql.execution.datasources.v2.parquet.ParquetScan
 import org.apache.spark.sql.functions.struct
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
 import org.apache.spark.util.Utils
 
 /**
  * A test suite that tests various Parquet queries.
  */
-abstract class ParquetQuerySuite extends QueryTest with ParquetTest with SharedSparkSession {
+abstract class ParquetQuerySuite extends ParquetTest
+  with QueryTest
+  with classic.SparkSessionBinder {
   import testImplicits._
 
   test("simple select queries") {
@@ -377,6 +379,74 @@ abstract class ParquetQuerySuite extends QueryTest with ParquetTest with SharedS
           testIgnoreCorruptFilesWithoutSchemaInfer(options)
         }.getCause
         assert(exception2.getMessage().contains("is not a Parquet file"))
+      }
+    }
+  }
+
+  test("SPARK-55857: Enabling/disabling ignoreMissingFiles") {
+    def testIgnoreMissingFiles(options: Map[String, String]): Unit = {
+      withTempDir { dir =>
+        val basePath = dir.getCanonicalPath
+        val fs = FileSystem.get(spark.sessionState.newHadoopConf())
+        val path1 = new Path(basePath, "first")
+        val path2 = new Path(basePath, "second")
+        spark.range(1).toDF("a").write.parquet(path1.toString)
+        spark.range(1, 2).toDF("a").write.parquet(path2.toString)
+        // Create DataFrame before deleting to capture file references in the query plan,
+        // then delete to simulate a race condition between listing and reading.
+        val df = spark.read.options(options).parquet(path1.toString, path2.toString)
+        fs.listStatus(path1)
+          .filter(f => f.isFile && !f.getPath.getName.startsWith("_"))
+          .foreach(f => fs.delete(f.getPath, false))
+        checkAnswer(df, Seq(Row(1)))
+      }
+    }
+
+    def testIgnoreMissingFilesWithoutSchemaInfer(options: Map[String, String]): Unit = {
+      withTempDir { dir =>
+        val basePath = dir.getCanonicalPath
+        val fs = FileSystem.get(spark.sessionState.newHadoopConf())
+        val path1 = new Path(basePath, "first")
+        val path2 = new Path(basePath, "second")
+        spark.range(1).toDF("a").write.parquet(path1.toString)
+        spark.range(1, 2).toDF("a").write.parquet(path2.toString)
+        val df = spark.read.schema("a long").options(options)
+          .parquet(path1.toString, path2.toString)
+        fs.listStatus(path1)
+          .filter(f => f.isFile && !f.getPath.getName.startsWith("_"))
+          .foreach(f => fs.delete(f.getPath, false))
+        checkAnswer(df, Seq(Row(1)))
+      }
+    }
+
+    // Test ignoreMissingFiles = true
+    Seq("SQLConf", "FormatOption").foreach { by =>
+      val (sqlConf, options) = by match {
+        case "SQLConf" => ("true", Map.empty[String, String])
+        // Explicitly set SQLConf to false but still should ignore missing files
+        case "FormatOption" => ("false", Map("ignoreMissingFiles" -> "true"))
+      }
+      withSQLConf(SQLConf.IGNORE_MISSING_FILES.key -> sqlConf) {
+        testIgnoreMissingFiles(options)
+        testIgnoreMissingFilesWithoutSchemaInfer(options)
+      }
+    }
+
+    // Test ignoreMissingFiles = false
+    Seq("SQLConf", "FormatOption").foreach { by =>
+      val (sqlConf, options) = by match {
+        case "SQLConf" => ("false", Map.empty[String, String])
+        // Explicitly set SQLConf to true but still should not ignore missing files
+        case "FormatOption" => ("true", Map("ignoreMissingFiles" -> "false"))
+      }
+      withSQLConf(SQLConf.IGNORE_MISSING_FILES.key -> sqlConf) {
+        checkErrorMatchPVals(
+          exception = intercept[SparkException] {
+            testIgnoreMissingFiles(options)
+          },
+          condition = "FAILED_READ_FILE.FILE_NOT_EXIST",
+          parameters = Map("path" -> ".*")
+        )
       }
     }
   }
@@ -790,6 +860,42 @@ abstract class ParquetQuerySuite extends QueryTest with ParquetTest with SharedS
       checkAnswer(
         spark.read.schema(userDefinedSchema).parquet(path),
         Row(Row(TestNestedStruct(1, 2L, 3.5D))))
+    }
+  }
+
+  test("loading UDT classes named in Parquet metadata respects the UDT allow list") {
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      val udtClass = classOf[TestNestedStructUDT].getName
+      val schema = new StructType().add("s", new TestNestedStructUDT, nullable = true)
+      val data = Seq(Row(TestNestedStruct(1, 2L, 3.5D)))
+      // Writing a UDT column embeds the UDT class name in the Parquet key-value metadata, which is
+      // read back and passed to DataType.fromJson during schema inference (the vulnerable path).
+      spark.createDataFrame(spark.sparkContext.parallelize(data), schema)
+        .coalesce(1)
+        .write
+        .parquet(path)
+
+      def inferredColumnType: DataType = spark.read.parquet(path).schema("s").dataType
+
+      // By default the UDT class named in the file metadata is loaded during schema inference.
+      assert(inferredColumnType.isInstanceOf[TestNestedStructUDT])
+
+      // With UDT loading disabled and the class not on the allow list, Spark must not load the
+      // class named in the file. Schema inference falls back to the underlying physical schema
+      // rather than instantiating the attacker-named class.
+      withSQLConf(SQLConf.ALLOW_CREATING_UDT_FROM_STRING.key -> "false") {
+        assert(!inferredColumnType.isInstanceOf[TestNestedStructUDT])
+        assert(!inferredColumnType.isInstanceOf[UserDefinedType[_]])
+        assert(inferredColumnType.isInstanceOf[StructType])
+      }
+
+      // Explicitly allow-listing the class restores UDT resolution end to end.
+      withSQLConf(
+          SQLConf.ALLOW_CREATING_UDT_FROM_STRING.key -> "false",
+          SQLConf.ALLOWED_DYNAMIC_UDT_CLASSES.key -> udtClass) {
+        assert(inferredColumnType.isInstanceOf[TestNestedStructUDT])
+      }
     }
   }
 

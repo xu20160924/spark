@@ -26,6 +26,7 @@ from pyspark.sql.types import (
     StructField,
     ArrayType,
     IntegerType,
+    MapType,
 )
 from pyspark.testing import assertDataFrameEqual
 from pyspark.testing.pandasutils import PandasOnSparkTestUtils
@@ -143,8 +144,12 @@ class SparkConnectFunctionTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_DATAFRAME",
-            messageParameters={"arg_name": "df", "arg_type": "Column"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "DataFrame",
+                "arg_name": "df",
+                "arg_type": "Column",
+            },
         )
 
     def test_normal_functions(self):
@@ -338,8 +343,12 @@ class SparkConnectFunctionTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN",
-            messageParameters={"arg_name": "condition", "arg_type": "bool"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "Column",
+                "arg_name": "condition",
+                "arg_type": "bool",
+            },
         )
 
     def test_sorting_functions_with_column(self):
@@ -758,6 +767,37 @@ class SparkConnectFunctionTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
                     sdf.select(scol.over(swin)).toPandas(),
                 )
 
+        # test counter_diff: requires non-negative values and has a two-argument form that
+        # accepts a start_time parameter, so a separate dataset is used.
+        counter_diff_query = """
+            SELECT * FROM VALUES
+            (0, TIMESTAMP_NTZ '2026-01-01 00:00:00',  100, TIMESTAMP_NTZ '2025-12-31 00:00:00'),
+            (0, TIMESTAMP_NTZ '2026-01-01 00:01:00',  200, TIMESTAMP_NTZ '2025-12-31 00:00:00'),
+            (0, TIMESTAMP_NTZ '2026-01-01 00:02:00',  300, TIMESTAMP_NTZ '2025-12-31 00:00:00'),
+            (0, TIMESTAMP_NTZ '2026-01-01 00:03:00', 1200, TIMESTAMP_NTZ '2026-01-01 00:02:15'),
+            (0, TIMESTAMP_NTZ '2026-01-01 00:04:00', 1300, TIMESTAMP_NTZ '2026-01-01 00:02:15'),
+            (0, TIMESTAMP_NTZ '2026-01-01 00:05:00',   50, TIMESTAMP_NTZ '2026-01-01 00:02:15'),
+            (0, TIMESTAMP_NTZ '2026-01-01 00:06:00',  100, TIMESTAMP_NTZ '2026-01-01 00:02:15'),
+            (0, TIMESTAMP_NTZ '2026-01-01 00:07:00',   20, TIMESTAMP_NTZ '2026-01-01 00:06:45'),
+            (0, TIMESTAMP_NTZ '2026-01-01 00:08:00',   60, TIMESTAMP_NTZ '2026-01-01 00:06:45'),
+            (1, TIMESTAMP_NTZ '2026-01-01 00:00:00',  100, TIMESTAMP_NTZ '2025-12-31 00:00:00'),
+            (1, TIMESTAMP_NTZ '2026-01-01 00:01:00',  200, TIMESTAMP_NTZ '2025-12-31 00:00:00'),
+            (1, TIMESTAMP_NTZ '2026-01-01 00:02:00',  300, TIMESTAMP_NTZ '2025-12-31 00:00:00'),
+            (1, TIMESTAMP_NTZ '2026-01-01 00:03:00', 1000, TIMESTAMP_NTZ '2025-12-31 00:00:00'),
+            (1, TIMESTAMP_NTZ '2026-01-01 00:04:00',   75, TIMESTAMP_NTZ '2026-01-01 00:03:15')
+            AS tab(p, t, c, s)
+            """
+        cdf_cd = self.connect.sql(counter_diff_query)
+        sdf_cd = self.spark.sql(counter_diff_query)
+        for ccol, scol in [
+            (CF.counter_diff("c"), SF.counter_diff("c")),
+            (CF.counter_diff("c", "s"), SF.counter_diff("c", "s")),
+        ]:
+            self.assert_eq(
+                cdf_cd.select(ccol.over(CW.partitionBy("p").orderBy("t"))).toPandas(),
+                sdf_cd.select(scol.over(SW.partitionBy("p").orderBy("t"))).toPandas(),
+            )
+
         # test aggregation functions
         for ccol, scol in [
             (CF.count("c"), SF.count("c")),
@@ -885,8 +925,12 @@ class SparkConnectFunctionTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_WINDOWSPEC",
-            messageParameters={"arg_name": "window", "arg_type": "Column"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "WindowSpec",
+                "arg_name": "window",
+                "arg_type": "Column",
+            },
         )
 
         # invalid window function
@@ -1213,8 +1257,12 @@ class SparkConnectFunctionTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_INT_OR_STR",
-            messageParameters={"arg_name": "start", "arg_type": "float"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "Column, int or str",
+                "arg_name": "start",
+                "arg_type": "float",
+            },
         )
 
         with self.assertRaises(PySparkTypeError) as pe:
@@ -1222,8 +1270,12 @@ class SparkConnectFunctionTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_INT_OR_STR",
-            messageParameters={"arg_name": "length", "arg_type": "float"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "Column, int or str",
+                "arg_name": "length",
+                "arg_type": "float",
+            },
         )
 
         # test sort_array
@@ -1672,7 +1724,7 @@ class SparkConnectFunctionTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
 
         # TODO: 'cdf.schema' has an extra metadata '{'__autoGeneratedAlias': 'true'}'
         self.assertEqual(_drop_metadata(cdf.schema), _drop_metadata(sdf.schema))
-        self.assertEqual(cdf.collect(), sdf.collect())
+        assertDataFrameEqual(cdf, sdf)
 
     def test_csv_functions(self):
         query = """
@@ -1774,6 +1826,7 @@ class SparkConnectFunctionTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
             "MAP<STRING,INT>",
             StructType([StructField("a", IntegerType())]),
             ArrayType(StructType([StructField("a", IntegerType())])),
+            MapType(StringType(), IntegerType()),
         ]:
             self.compare_by_show(
                 cdf.select(CF.from_json(cdf.a, schema)),
@@ -1839,8 +1892,12 @@ class SparkConnectFunctionTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_DATATYPE_OR_STR",
-            messageParameters={"arg_name": "schema", "arg_type": "list"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "Column, str or DataType",
+                "arg_name": "schema",
+                "arg_type": "list",
+            },
         )
 
         # test get_json_object
@@ -1976,8 +2033,12 @@ class SparkConnectFunctionTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_STR_OR_STRUCT",
-            messageParameters={"arg_name": "schema", "arg_type": "list"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "StructType, Column or str",
+                "arg_name": "schema",
+                "arg_type": "list",
+            },
         )
 
         # test schema_of_xml
@@ -2155,8 +2216,20 @@ class SparkConnectFunctionTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
             sdf.select(SF.regexp_replace(sdf.b, "(a+)(b)?(c)", "--")).toPandas(),
         )
         self.assert_eq(
+            cdf.select(CF.regexp_replace(cdf.b, "(a+)(b)?(c)", "--", 2)).toPandas(),
+            sdf.select(SF.regexp_replace(sdf.b, "(a+)(b)?(c)", "--", 2)).toPandas(),
+        )
+        self.assert_eq(
             cdf.select(CF.translate(cdf.b, "abc", "xyz")).toPandas(),
             sdf.select(SF.translate(sdf.b, "abc", "xyz")).toPandas(),
+        )
+        self.assert_eq(
+            cdf.select(CF.instr(cdf.b, "abc", 1)).toPandas(),
+            sdf.select(SF.instr(sdf.b, "abc", 1)).toPandas(),
+        )
+        self.assert_eq(
+            cdf.select(CF.instr(cdf.e, ".", -1, 2)).toPandas(),
+            sdf.select(SF.instr(sdf.e, ".", -1, 2)).toPandas(),
         )
 
     # TODO(SPARK-41283): To compare toPandas for test cases with dtypes marked
@@ -2369,8 +2442,12 @@ class SparkConnectFunctionTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_STR",
-            messageParameters={"arg_name": "slideDuration", "arg_type": "int"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "str",
+                "arg_name": "slideDuration",
+                "arg_type": "int",
+            },
         )
 
         with self.assertRaises(PySparkTypeError) as pe:
@@ -2378,8 +2455,8 @@ class SparkConnectFunctionTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_STR",
-            messageParameters={"arg_name": "startTime", "arg_type": "int"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={"expected_type": "str", "arg_name": "startTime", "arg_type": "int"},
         )
 
         # test session_window
@@ -2578,9 +2655,7 @@ class SparkConnectFunctionTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
         )
 
         # Functions in Spark Connect we do not expect to be available in classic PySpark
-        cf_excluded_fn = {
-            "check_dependencies",  # internal helper function
-        }
+        cf_excluded_fn = set()
 
         self.assertEqual(
             cf_fn - sf_fn,

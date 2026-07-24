@@ -84,7 +84,7 @@ install_app() {
     fi
     # if both were unsuccessful, exit
     if [ ! -f "${local_tarball}" ]; then
-      echo -n "ERROR: Cannot download ${remote_tarball} with cURL or wget; please install manually and try again."
+      echo -n "ERROR: Cannot download ${remote_tarball} with cURL or wget; please install manually and try again." 1>&2
       exit 2
     fi
     # Checksum may not have been specified; don't check if doesn't exist
@@ -94,7 +94,7 @@ install_app() {
         # Assuming SHA512 here for now
         echo "Verifying checksum from ${local_checksum}" 1>&2
         if ! shasum -a 512 -c "${local_checksum}" > /dev/null ; then
-          echo "Bad checksum from ${remote_checksum}"
+          echo "Bad checksum from ${remote_checksum}" 1>&2
           exit 2
         fi
       fi
@@ -125,21 +125,22 @@ install_mvn() {
   fi
   if [ $(version $MVN_DETECTED_VERSION) -ne $(version $MVN_VERSION) ]; then
     local MVN_TARBALL="apache-maven-${MVN_VERSION}-bin.tar.gz"
-    local FILE_PATH="maven/maven-3/${MVN_VERSION}/binaries/${MVN_TARBALL}"
-    local APACHE_MIRROR=${APACHE_MIRROR:-'https://www.apache.org/dyn/closer.lua'}
-    local MIRROR_URL_QUERY="?action=download"
+    local FILE_PATH="org/apache/maven/apache-maven/${MVN_VERSION}/${MVN_TARBALL}"
+    local MIRROR_BASE=${DEFAULT_ARTIFACT_REPOSITORY:-https://maven-central.storage-download.googleapis.com/maven2/}
+    local MIRROR_URL_QUERY=""
 
     if [ $(command -v curl) ]; then
-      if ! curl -L --output /dev/null --silent --head --fail "${APACHE_MIRROR}/${FILE_PATH}${MIRROR_URL_QUERY}" ; then
+      if ! curl -L --output /dev/null --silent --head --fail "${MIRROR_BASE%/}/${FILE_PATH}${MIRROR_URL_QUERY}" ; then
         # Fall back to archive.apache.org for older Maven
-        echo "Falling back to archive.apache.org to download Maven"
-        APACHE_MIRROR="https://archive.apache.org/dist"
+        echo "Falling back to archive.apache.org to download Maven" 1>&2
+        FILE_PATH="maven/maven-3/${MVN_VERSION}/binaries/${MVN_TARBALL}"
+        MIRROR_BASE="https://archive.apache.org/dist"
         MIRROR_URL_QUERY=""
       fi
     fi
 
     install_app \
-      "${APACHE_MIRROR}" \
+      "${MIRROR_BASE%/}" \
       "${FILE_PATH}" \
       "${MIRROR_URL_QUERY}" \
       "sha512" \
@@ -157,6 +158,14 @@ cd "${_CALLING_DIR}"
 
 # Set any `mvn` options if not already present
 export MAVEN_OPTS=${MAVEN_OPTS:-"$_COMPILE_JVM_OPTS"}
+
+# Some Maven plugins (e.g. the mvn-scalafmt plugin used by `dev/lint-scala`) resolve their own
+# dependencies through Coursier, which ignores MAVEN_MIRROR_URL and the POM repositories. Bridge
+# MAVEN_MIRROR_URL into COURSIER_REPOSITORIES so mirror-only environments work out of the box.
+# Respect an existing COURSIER_REPOSITORIES if the caller already set one.
+if [ -n "${MAVEN_MIRROR_URL}" ] && [ -z "${COURSIER_REPOSITORIES}" ]; then
+  export COURSIER_REPOSITORIES="ivy2Local|${MAVEN_MIRROR_URL}"
+fi
 
 echo "Using \`mvn\` from path: $MVN_BIN" 1>&2
 

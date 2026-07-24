@@ -200,10 +200,10 @@ public interface TableChange {
    * If the field does not exist, the change will result in an {@link IllegalArgumentException}.
    *
    * @param fieldNames field names of the column to update
-   * @param newComment the new comment
+   * @param newComment the new comment, or null to remove the existing comment
    * @return a TableChange for the update
    */
-  static TableChange updateColumnComment(String[] fieldNames, String newComment) {
+  static TableChange updateColumnComment(String[] fieldNames, @Nullable String newComment) {
     return new UpdateColumnComment(fieldNames, newComment);
   }
 
@@ -304,6 +304,11 @@ public interface TableChange {
     }
 
     @Override
+    public String toString() {
+      return "SET PROPERTY " + property + " = " + value;
+    }
+
+    @Override
     public boolean equals(Object o) {
       if (this == o) return true;
       if (o == null || getClass() != o.getClass()) return false;
@@ -347,6 +352,11 @@ public interface TableChange {
 
     public String property() {
       return property;
+    }
+
+    @Override
+    public String toString() {
+      return "REMOVE PROPERTY " + property;
     }
 
     @Override
@@ -430,6 +440,10 @@ public interface TableChange {
     String[] fieldNames();
   }
 
+  static String fieldPath(String[] fieldNames) {
+    return String.join(".", fieldNames);
+  }
+
   /**
    * A TableChange to add a field. The implementation may need to back-fill all the existing data
    * to add this new column, or remember the column default value specified here and let the reader
@@ -507,6 +521,11 @@ public interface TableChange {
       result = 31 * result + Arrays.hashCode(fieldNames);
       return result;
     }
+
+    @Override
+    public String toString() {
+      return "ADD COLUMN " + TableChange.fieldPath(fieldNames) + " " + dataType.sql();
+    }
   }
 
   /**
@@ -550,6 +569,11 @@ public interface TableChange {
       result = 31 * result + Arrays.hashCode(fieldNames);
       return result;
     }
+
+    @Override
+    public String toString() {
+      return "RENAME COLUMN " + TableChange.fieldPath(fieldNames) + " TO " + newName;
+    }
   }
 
   /**
@@ -591,6 +615,11 @@ public interface TableChange {
       int result = Objects.hash(newDataType);
       result = 31 * result + Arrays.hashCode(fieldNames);
       return result;
+    }
+
+    @Override
+    public String toString() {
+      return "ALTER COLUMN " + TableChange.fieldPath(fieldNames) + " TYPE " + newDataType.sql();
     }
   }
 
@@ -634,6 +663,13 @@ public interface TableChange {
       result = 31 * result + Arrays.hashCode(fieldNames);
       return result;
     }
+
+    @Override
+    public String toString() {
+      return nullable
+          ? "ALTER COLUMN " + TableChange.fieldPath(fieldNames) + " DROP NOT NULL"
+          : "ALTER COLUMN " + TableChange.fieldPath(fieldNames) + " SET NOT NULL";
+    }
   }
 
   /**
@@ -657,6 +693,11 @@ public interface TableChange {
       return fieldNames;
     }
 
+    /**
+     * Returns the new comment of the column, or null to remove the existing comment (making the
+     * comment genuinely absent, as opposed to setting it to an empty string).
+     */
+    @Nullable
     public String newComment() {
       return newComment;
     }
@@ -667,7 +708,7 @@ public interface TableChange {
       if (o == null || getClass() != o.getClass()) return false;
       UpdateColumnComment that = (UpdateColumnComment) o;
       return Arrays.equals(fieldNames, that.fieldNames) &&
-        newComment.equals(that.newComment);
+        Objects.equals(newComment, that.newComment);
     }
 
     @Override
@@ -675,6 +716,13 @@ public interface TableChange {
       int result = Objects.hash(newComment);
       result = 31 * result + Arrays.hashCode(fieldNames);
       return result;
+    }
+
+    @Override
+    public String toString() {
+      return newComment == null
+              ? "ALTER COLUMN " + TableChange.fieldPath(fieldNames) + " DROP COMMENT"
+              : "ALTER COLUMN " + TableChange.fieldPath(fieldNames) + " COMMENT";
     }
   }
 
@@ -717,6 +765,11 @@ public interface TableChange {
       int result = Objects.hash(position);
       result = 31 * result + Arrays.hashCode(fieldNames);
       return result;
+    }
+
+    @Override
+    public String toString() {
+      return "ALTER COLUMN " + TableChange.fieldPath(fieldNames) + " " + position.toString();
     }
   }
 
@@ -774,6 +827,14 @@ public interface TableChange {
       result = 31 * result + Objects.hashCode(newCurrentDefault);
       return result;
     }
+
+    @Override
+    public String toString() {
+      return newCurrentDefault == null
+              ? "ALTER COLUMN " + TableChange.fieldPath(fieldNames) + " DROP DEFAULT"
+              : "ALTER COLUMN " + TableChange.fieldPath(fieldNames) + " SET DEFAULT " +
+                  newCurrentDefault.getSql();
+    }
   }
 
   /**
@@ -808,6 +869,11 @@ public interface TableChange {
     @Override
     public int hashCode() {
       return Arrays.hashCode(fieldNames);
+    }
+
+    @Override
+    public String toString() {
+      return "DROP COLUMN " + TableChange.fieldPath(fieldNames);
     }
   }
 

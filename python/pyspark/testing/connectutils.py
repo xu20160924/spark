@@ -36,7 +36,6 @@ from pyspark.testing.utils import PySparkBaseTestCase
 from pyspark.testing.sqlutils import SQLTestUtils
 from pyspark.sql.session import SparkSession as PySparkSession
 
-
 if should_test_connect:
     from pyspark.sql.connect.dataframe import DataFrame
     from pyspark.sql.connect.plan import Read, Range, SQL, LogicalPlan
@@ -227,7 +226,7 @@ class ReusedConnectTestCase(PySparkBaseTestCase, SQLTestUtils, PySparkErrorTestU
     not should_test_connect or is_remote_only(),
     connect_requirement_message or "Requires JVM access",
 )
-class ReusedMixedTestCase(ReusedConnectTestCase, SQLTestUtils):
+class ReusedMixedTestCase(ReusedConnectTestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()

@@ -160,6 +160,32 @@ class BasicExecutorFeatureStepSuite extends SparkFunSuite with BeforeAndAfter {
     assert(executor.pod.getSpec.getTerminationGracePeriodSeconds === 0L)
   }
 
+  test("Set allowPrivilegeEscalation to false on the executor container by default") {
+    initDefaultProfile(baseConf)
+    val step = new BasicExecutorFeatureStep(newExecutorConf(), new SecurityManager(baseConf),
+      defaultProfile)
+    val executor = step.configurePod(SparkPod.initialPod())
+    assert(executor.container.getSecurityContext.getAllowPrivilegeEscalation === false)
+  }
+
+  test("Support spark.kubernetes.executor.securityContext.allowPrivilegeEscalation") {
+    baseConf.set(KUBERNETES_EXECUTOR_ALLOW_PRIVILEGE_ESCALATION, true)
+    initDefaultProfile(baseConf)
+    val step = new BasicExecutorFeatureStep(newExecutorConf(), new SecurityManager(baseConf),
+      defaultProfile)
+    val executor = step.configurePod(SparkPod.initialPod())
+    assert(executor.container.getSecurityContext.getAllowPrivilegeEscalation === true)
+  }
+
+  test("executor allowPrivilegeEscalation falls back to the shared config") {
+    baseConf.set(KUBERNETES_ALLOW_PRIVILEGE_ESCALATION, true)
+    initDefaultProfile(baseConf)
+    val step = new BasicExecutorFeatureStep(newExecutorConf(), new SecurityManager(baseConf),
+      defaultProfile)
+    val executor = step.configurePod(SparkPod.initialPod())
+    assert(executor.container.getSecurityContext.getAllowPrivilegeEscalation === true)
+  }
+
   test("basic executor pod with resources") {
     val fpgaResourceID = new ResourceID(SPARK_EXECUTOR_PREFIX, FPGA)
     val gpuExecutorResourceID = new ResourceID(SPARK_EXECUTOR_PREFIX, GPU)
@@ -666,6 +692,28 @@ class BasicExecutorFeatureStepSuite extends SparkFunSuite with BeforeAndAfter {
     val memoryPolicy = resizePolicies.find(_.getResourceName == "memory")
     assert(memoryPolicy.isDefined)
     assert(memoryPolicy.get.getRestartPolicy === "NotRequired")
+  }
+
+  test("SPARK-55639: ENV_EXECUTOR_CORES is spark.task.cpus when recoveryMode is enabled") {
+    val rpb = new ResourceProfileBuilder()
+    val ereq = new ExecutorResourceRequests()
+    val treq = new TaskResourceRequests()
+    ereq.cores(4)
+    treq.cpus(2)
+    rpb.require(ereq).require(treq)
+    val rp = rpb.build()
+
+    var step = new BasicExecutorFeatureStep(newExecutorConf(), new SecurityManager(baseConf), rp)
+    var executor = step.configurePod(SparkPod.initialPod())
+    var cores = executor.container.getEnv.asScala.find(_.getName == ENV_EXECUTOR_CORES).get.getValue
+    assert(cores === "4")
+
+    baseConf.set(KUBERNETES_ALLOCATION_RECOVERY_MODE_ENABLED, true)
+    baseConf.set("spark.task.cpus", "2")
+    step = new BasicExecutorFeatureStep(newExecutorConf(), new SecurityManager(baseConf), rp)
+    executor = step.configurePod(SparkPod.initialPod())
+    cores = executor.container.getEnv.asScala.find(_.getName == ENV_EXECUTOR_CORES).get.getValue
+    assert(cores === "2")
   }
 
   // There is always exactly one controller reference, and it points to the driver pod.

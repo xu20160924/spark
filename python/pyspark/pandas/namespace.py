@@ -18,6 +18,7 @@
 """
 Wrappers around spark that correspond to common pandas functions.
 """
+
 from typing import (
     Any,
     Callable,
@@ -64,6 +65,7 @@ from pyspark.sql.types import (
     FloatType,
     DoubleType,
     BooleanType,
+    NumericType,
     TimestampType,
     TimestampNTZType,
     DecimalType,
@@ -139,6 +141,7 @@ __all__ = [
     "broadcast",
     "read_orc",
     "json_normalize",
+    "show_versions",
 ]
 
 
@@ -278,9 +281,9 @@ def read_csv(
     ----------
     path : str or list
         Path(s) of the CSV file(s) to be read.
-    sep : str, default ‘,’
+    sep : str, default ','
         Delimiter to use. Non empty string.
-    header : int, default ‘infer’
+    header : int, default 'infer'
         Whether to use the column names, and the start of the data.
         Default behavior is to infer the column names: if no names are passed
         the behavior is identical to `header=0` and column names are inferred from
@@ -302,7 +305,7 @@ def read_csv(
         If callable, the callable function will be evaluated against the column names,
         returning names where the callable function evaluates to `True`.
     dtype : Type name or dict of column -> type, default None
-        Data type for data or columns. E.g. {‘a’: np.float64, ‘b’: np.int32} Use str or object
+        Data type for data or columns. E.g. {'a': np.float64, 'b': np.int32} Use str or object
         together with suitable na_values settings to preserve and not interpret dtype.
     nrows : int, default None
         Number of rows to read from the CSV file.
@@ -435,7 +438,7 @@ def read_csv(
                 )
             if len(missing) > 0:
                 raise ValueError(
-                    "Usecols do not match columns, columns expected but not " "found: %s" % missing
+                    "Usecols do not match columns, columns expected but not found: %s" % missing
                 )
 
             if len(column_labels) > 0:
@@ -1765,9 +1768,16 @@ def to_datetime(
                 "The 'infer_datetime_format' keyword is not supported in pandas 3.0.0 and later."
             )
 
+    ret_type: type
+    if LooseVersion(pd.__version__) < "3.0.0":
+        ret_type = Series[np.datetime64]
+    else:
+        # The unit is unpredictable.
+        ret_type = None
+
     def pandas_to_datetime(
         pser_or_pdf: Union[pd.DataFrame, pd.Series], cols: Optional[List[str]] = None
-    ) -> Series[np.datetime64]:
+    ) -> ret_type:
         if isinstance(pser_or_pdf, pd.DataFrame):
             pser_or_pdf = pser_or_pdf[cols]
         return pd.to_datetime(pser_or_pdf, **kwargs)
@@ -1775,7 +1785,7 @@ def to_datetime(
     if isinstance(arg, Series):
         return arg.pandas_on_spark.transform_batch(pandas_to_datetime)
     if isinstance(arg, DataFrame):
-        unit = {k: _unit_map[k.lower()] for k in arg.keys() if k.lower() in _unit_map}
+        unit = {k: _unit_map[k.lower()] for k in arg if k.lower() in _unit_map}
         unit_rev = {v: k for k, v in unit.items()}
         list_cols = [unit_rev["year"], unit_rev["month"], unit_rev["day"]]
         for u in ["h", "m", "s", "ms", "us"]:
@@ -2028,17 +2038,22 @@ def to_timedelta(
     TimedeltaIndex(['0 days', '1 days', '2 days', '3 days', '4 days'],
                    dtype='timedelta64[ns]', freq=None)
     """
-
-    def pandas_to_timedelta(pser: pd.Series) -> np.timedelta64:
-        return pd.to_timedelta(
-            arg=pser,
-            unit=unit,
-            errors=errors,
-        )
-
     if isinstance(arg, Series):
-        return arg.transform(pandas_to_timedelta)
+        ret_dtype: Union[type, Dtype]
+        if LooseVersion(pd.__version__) < "3.0.0":
+            ret_dtype = np.timedelta64
+        else:
+            # The unit is unpredictable.
+            ret_dtype = None
 
+        def pandas_to_timedelta(pser: pd.Series) -> ret_dtype:
+            return pd.to_timedelta(
+                arg=pser,
+                unit=unit,
+                errors=errors,
+            )
+
+        return arg.transform(pandas_to_timedelta)
     else:
         return pd.to_timedelta(
             arg=arg,
@@ -2101,7 +2116,7 @@ def timedelta_range(
     TimedeltaIndex(['2 days', '3 days', '4 days'], dtype='timedelta64[ns]', freq=None)
 
     The freq parameter specifies the frequency of the TimedeltaIndex.
-    Only fixed frequencies can be passed, non-fixed frequencies such as ‘M’ (month end) will raise.
+    Only fixed frequencies can be passed, non-fixed frequencies such as 'M' (month end) will raise.
 
     >>> ps.timedelta_range(start='1 day', end='2 days', freq='6h')
     ... # doctest: +NORMALIZE_WHITESPACE
@@ -2267,11 +2282,13 @@ def get_dummies(
                     raise KeyError(name_like_string(columns))
                 if prefix is None:
                     prefix = [
-                        str(label[len(columns) :])
-                        if len(label) > len(columns) + 1
-                        else label[len(columns)]
-                        if len(label) == len(columns) + 1
-                        else ""
+                        (
+                            str(label[len(columns) :])
+                            if len(label) > len(columns) + 1
+                            else label[len(columns)]
+                            if len(label) == len(columns) + 1
+                            else ""
+                        )
                         for label in column_labels
                     ]
             elif any(isinstance(col, tuple) for col in columns) and any(
@@ -2554,9 +2571,11 @@ def concat(
 
         level: int = min(psdf._internal.column_labels_level for psdf in psdfs)
         psdfs = [
-            DataFrame._index_normalized_frame(level, psdf)
-            if psdf._internal.column_labels_level > level
-            else psdf
+            (
+                DataFrame._index_normalized_frame(level, psdf)
+                if psdf._internal.column_labels_level > level
+                else psdf
+            )
             for psdf in psdfs
         ]
 
@@ -2639,6 +2658,10 @@ def concat(
             series_names.add(obj.name)
             if not ignore_index and not should_return_series:
                 new_objs.append(obj.to_frame())
+            elif LooseVersion(pd.__version__) >= "3.0.0" and not should_return_series:
+                # pandas 3 preserves a named Series as its own column during
+                # row-wise concat with ignore_index=True instead of renaming it to 0.
+                new_objs.append(obj.to_frame())
             else:
                 new_objs.append(obj.to_frame(DEFAULT_SERIES_NAME))
         else:
@@ -2709,8 +2732,10 @@ def concat(
 
                 # TODO: NaN and None difference for missing values. pandas seems to be filling NaN.
                 sdf = psdf._internal.resolved_copy.spark_frame
-                for label in columns_to_add:
-                    sdf = sdf.withColumn(name_like_string(label), F.lit(None))
+                if columns_to_add:
+                    sdf = sdf.withColumns(
+                        {name_like_string(label): F.lit(None) for label in columns_to_add}
+                    )
 
                 data_columns = psdf._internal.data_spark_column_names + [
                     name_like_string(label) for label in columns_to_add
@@ -3651,6 +3676,8 @@ def to_numeric(arg, errors="raise"):
     1.0
     """
     if isinstance(arg, Series):
+        if isinstance(arg.spark.data_type, (NumericType, BooleanType)):
+            return arg.copy()
         if errors == "coerce":
             spark_session = arg._internal.spark_frame.sparkSession
             if is_ansi_mode_enabled(spark_session):
@@ -3855,6 +3882,134 @@ def json_normalize(
     return ps.DataFrame(internal)
 
 
+def _get_sys_info() -> Dict[str, Any]:
+    """Returns system information as a dictionary."""
+    import locale
+    import os
+    import platform
+    import struct
+    import sys as _sys
+
+    uname_result = platform.uname()
+    try:
+        language_code, encoding = locale.getlocale()
+    except (TypeError, ValueError):
+        language_code, encoding = (None, None)
+    return {
+        "python": platform.python_version(),
+        "python-bits": struct.calcsize("P") * 8,
+        "OS": uname_result.system,
+        "OS-release": uname_result.release,
+        "Version": uname_result.version,
+        "machine": uname_result.machine,
+        "processor": uname_result.processor,
+        "byteorder": _sys.byteorder,
+        "LC_ALL": os.environ.get("LC_ALL"),
+        "LANG": os.environ.get("LANG"),
+        "LOCALE": {"language-code": language_code, "encoding": encoding},
+    }
+
+
+def _get_dependency_info() -> Dict[str, Optional[str]]:
+    """Returns dependency information as a dictionary."""
+    import importlib
+
+    import pyspark
+
+    deps = [
+        "pyspark",
+        "pandas",
+        "numpy",
+        "pyarrow",
+        "grpc",
+        "google.protobuf",
+        "matplotlib",
+        "IPython",
+        "sphinx",
+        "plotly",
+        "tabulate",
+        "scipy",
+        "mlflow",
+    ]
+    result: Dict[str, Optional[str]] = {}
+    for modname in deps:
+        if modname == "pyspark":
+            result[modname] = pyspark.__version__
+            continue
+        try:
+            mod = importlib.import_module(modname)
+        except ImportError:
+            result[modname] = None
+        except Exception:
+            # Dependency conflicts may cause non-ImportError failures.
+            result[modname] = "N/A"
+        else:
+            result[modname] = getattr(mod, "__version__", None)
+    return result
+
+
+def show_versions(as_json: Union[str, bool] = False) -> None:
+    """
+    Provide useful information, important for bug reports.
+
+    It comprises info about hosting operation system, pyspark.pandas version,
+    and versions of other installed relative packages.
+
+    .. versionadded:: 4.3.0
+
+    Parameters
+    ----------
+    as_json : str or bool, default False
+        * If False, outputs info in a human readable form to the console.
+        * If str, it will be considered as a path to a file.
+          Info will be written to that file in JSON format.
+        * If True, outputs info in JSON format to the console.
+
+    Examples
+    --------
+    >>> ps.show_versions()  # doctest: +SKIP
+    INSTALLED VERSIONS
+    ------------------
+    python           : 3.10.6.final.0
+    python-bits      : 64
+    ...
+    pyspark          : 4.3.0.dev0
+    pandas           : 2.2.0
+    numpy            : 1.24.3
+    pyarrow          : 15.0.0
+    ...
+    """
+    sys_info = _get_sys_info()
+    deps = _get_dependency_info()
+
+    if as_json:
+        import sys as _sys
+
+        j = {"system": sys_info, "dependencies": deps}
+
+        if as_json is True:
+            _sys.stdout.writelines(json.dumps(j, indent=2))
+        else:
+            assert isinstance(as_json, str)
+            with open(as_json, "w", encoding="utf-8") as f:
+                json.dump(j, f, indent=2)
+        return
+
+    locale_info = sys_info["LOCALE"]
+    sys_info["LOCALE"] = "{language_code}.{encoding}".format(
+        language_code=locale_info["language-code"], encoding=locale_info["encoding"]
+    )
+
+    maxlen = max(len(x) for x in deps)
+    print("\nINSTALLED VERSIONS")
+    print("------------------")
+    for k, v in sys_info.items():
+        print(f"{k:<{maxlen}}: {v}")
+    print("")
+    for k, v in deps.items():
+        print(f"{k:<{maxlen}}: {v}")
+
+
 def _get_index_map(
     sdf: PySparkDataFrame, index_col: Optional[Union[str, List[str]]] = None
 ) -> Tuple[Optional[List[PySparkColumn]], Optional[List[Label]]]:
@@ -3926,7 +4081,7 @@ def _test() -> None:
     path = tempfile.mkdtemp()
     globs["path"] = path
 
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.pandas.namespace,
         globs=globs,
         optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE,

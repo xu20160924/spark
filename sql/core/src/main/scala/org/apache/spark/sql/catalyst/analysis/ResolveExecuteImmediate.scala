@@ -19,6 +19,7 @@ package org.apache.spark.sql.catalyst.analysis
 
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.SqlScriptingContextManager
+import org.apache.spark.sql.catalyst.catalog.{SqlScriptingContextManager => SqlScriptingContextManagerTrait}
 import org.apache.spark.sql.catalyst.expressions.{Alias, Expression, VariableReference}
 import org.apache.spark.sql.catalyst.plans.logical.{Command, CompoundBody, LogicalPlan, SetVariable}
 import org.apache.spark.sql.catalyst.rules.Rule
@@ -34,6 +35,9 @@ import org.apache.spark.sql.types.StringType
  * Analysis rule that resolves and executes EXECUTE IMMEDIATE statements during analysis,
  * replacing them with the results, similar to how CALL statements work.
  * This rule combines resolution and execution in a single pass.
+ *
+ * When sub-expressions are not yet resolved, the node is returned unchanged so that the
+ * fixed-point analyzer re-applies this rule on the next iteration.
  */
 case class ResolveExecuteImmediate(sparkSession: SparkSession, catalogManager: CatalogManager)
   extends Rule[LogicalPlan] {
@@ -42,21 +46,43 @@ case class ResolveExecuteImmediate(sparkSession: SparkSession, catalogManager: C
     plan.resolveOperatorsWithPruning(_.containsPattern(EXECUTE_IMMEDIATE), ruleId) {
       case node @ UnresolvedExecuteImmediate(sqlStmtStr, args, targetVariables) =>
         if (sqlStmtStr.resolved && targetVariables.forall(_.resolved) && args.forall(_.resolved)) {
-          // All resolved - execute immediately and handle INTO clause if present
-          if (targetVariables.nonEmpty) {
-            // EXECUTE IMMEDIATE ... INTO should generate SetVariable plan with eagerly executed
-            // source
-            val finalTargetVars = extractTargetVariables(targetVariables)
-            val executedSource = executeImmediateQuery(sqlStmtStr, args, hasIntoClause = true)
-            SetVariable(finalTargetVars, executedSource)
-          } else {
-            // Regular EXECUTE IMMEDIATE without INTO - execute and return result directly
-            executeImmediateQuery(sqlStmtStr, args, hasIntoClause = false)
-          }
+          ResolveExecuteImmediate.resolveExecuteImmediate(
+            sparkSession, sqlStmtStr, args, targetVariables)
         } else {
-          // Not all resolved yet - wait for next iteration
           node
         }
+    }
+  }
+}
+
+/**
+ * Companion object containing shared resolution logic for `EXECUTE IMMEDIATE` statements.
+ */
+object ResolveExecuteImmediate {
+
+  /**
+   * Resolves an [[UnresolvedExecuteImmediate]] node into an executable plan.
+   *
+   * All expressions (`sqlStmtStr`, `args`, `targetVariables`) must already be resolved
+   * before calling this method.
+   *
+   * When an `INTO` clause is present, the dynamic SQL is eagerly parsed and analyzed, and
+   * the analyzed plan is wrapped in a [[SetVariable]] plan that assigns output columns to
+   * the target variables. Without `INTO`, the resulting plan is returned directly
+   * (commands are executed eagerly; queries are returned analyzed but unexecuted).
+   */
+  def resolveExecuteImmediate(
+      sparkSession: SparkSession,
+      sqlStmtStr: Expression,
+      args: Seq[Expression],
+      targetVariables: Seq[Expression]): LogicalPlan = {
+    if (targetVariables.nonEmpty) {
+      val finalTargetVars = extractTargetVariables(targetVariables)
+      val executedSource = executeImmediateQuery(
+        sparkSession, sqlStmtStr, args, hasIntoClause = true)
+      SetVariable(finalTargetVars, executedSource)
+    } else {
+      executeImmediateQuery(sparkSession, sqlStmtStr, args, hasIntoClause = false)
     }
   }
 
@@ -80,6 +106,7 @@ case class ResolveExecuteImmediate(sparkSession: SparkSession, catalogManager: C
   }
 
   private def executeImmediateQuery(
+      sparkSession: SparkSession,
       sqlStmtStr: Expression,
       args: Seq[Expression],
       hasIntoClause: Boolean): LogicalPlan = {
@@ -96,10 +123,10 @@ case class ResolveExecuteImmediate(sparkSession: SparkSession, catalogManager: C
       stopIndex = Some(sqlString.length - 1)
     )
 
-    // Execute the query recursively with isolated local variable context and EXECUTE IMMEDIATE
-    // origin. The isolation must cover parsing, analysis, and execution phases.
-    // CurrentOrigin.withOrigin ensures expressions created during parsing get the proper context
-    val result = withIsolatedLocalVariableContext {
+    // Execute the query with local variables hidden and EXECUTE IMMEDIATE origin set.
+    // Both must cover parsing, analysis, and execution phases.
+    // CurrentOrigin.withOrigin ensures expressions created during parsing get the proper context.
+    val result = withHiddenLocalVariables {
       CurrentOrigin.withOrigin(executeImmediateOrigin) {
         // Use shared parameterized query execution logic (same as OPEN CURSOR)
         val df = if (args.isEmpty) {
@@ -121,9 +148,9 @@ case class ResolveExecuteImmediate(sparkSession: SparkSession, catalogManager: C
           throw QueryCompilationErrors.sqlScriptInExecuteImmediate(sqlString)
         }
 
-        // Force analysis to happen within the isolated context to ensure local variables
-        // are not accessible. This is critical because DataFrames are lazy and analysis
-        // would otherwise happen outside the isolation context.
+        // Force analysis to happen while local variables are hidden. This is critical  because
+        // DataFrames are lazy and analysis would otherwise happen after withHiddenLocalVariables
+        // has restored the original context.
         df.queryExecution.analyzed
         df
       }
@@ -185,14 +212,32 @@ case class ResolveExecuteImmediate(sparkSession: SparkSession, catalogManager: C
   }
 
   /**
-   * Temporarily isolates the SQL scripting context during EXECUTE IMMEDIATE execution.
-   * This makes withinSqlScript() return false, ensuring that statements within EXECUTE IMMEDIATE
-   * are not affected by the outer SQL script context (e.g., local variables, script-specific
-   * errors).
+   * Temporarily hides the local variable context while executing the `EXECUTE IMMEDIATE` command.
+   * This is expected behavior, as local variables cannot be resolved within the body of this
+   * command. This does not apply to session variables. The rest of the SQL scripting context is
+   * preserved.
+   *
+   * {{{
+   *   DECLARE VARIABLE v1 = 1; -- Session variable.
+   *   BEGIN
+   *     DECLARE v2 = 2; -- Local variable.
+   *     EXECUTE IMMEDIATE 'SELECT v1'; -- Should work.
+   *     EXECUTE IMMEDIATE 'SELECT v2'; -- Should fail.
+   *     EXECUTE IMMEDIATE 'SELECT ?' USING v2; -- Should work.
+   *   END
+   * }}}
    */
-  private def withIsolatedLocalVariableContext[A](f: => A): A = {
-    // Completely clear the SQL scripting context to make withinSqlScript() return false
-    val handle = SqlScriptingContextManager.create(null)
-    handle.runWith(f)
+  private def withHiddenLocalVariables[A](f: => A): A = {
+    val newContextManager = SqlScriptingContextManager.get() match {
+      case Some(contextManager) =>
+        // SqlScriptingContextManagerTrait is catalog.SqlScriptingContextManager, renamed on import
+        // to distinguish from the object of the same name in org.apache.spark.sql.catalyst.
+        new SqlScriptingContextManagerTrait {
+          override def getContext = contextManager.getContext
+          override def getVariableManager = None
+        }
+      case None => null
+    }
+    SqlScriptingContextManager.create(newContextManager).runWith(f)
   }
 }

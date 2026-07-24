@@ -33,6 +33,7 @@ import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.util.ArrayImplicits._
+import org.apache.spark.util.SizeEstimator
 import org.apache.spark.util.collection.{OpenHashMap, Utils}
 
 /**
@@ -235,8 +236,11 @@ class CountVectorizer @Since("1.5.0") (@Since("1.5.0") override val uid: String)
 
     val fullVocabSize = wordCounts.count()
 
+    val ordering = Ordering.Tuple2(Ordering.Long, Ordering.String.reverse)
+      .on[(String, Long)] { case (word, count) => (count, word) }
+
     val vocab = wordCounts
-      .top(math.min(fullVocabSize, vocSize).toInt)(Ordering.by(_._2))
+      .top(math.min(fullVocabSize, vocSize).toInt)(ordering)
       .map(_._1)
 
     if (input.getStorageLevel != StorageLevel.NONE) {
@@ -281,6 +285,13 @@ class CountVectorizerModel(
 
   // For ml connect only
   private[ml] def this() = this("", Array.empty)
+
+  private[spark] override def estimatedSize: Long = {
+    var size = estimateMatadataSize
+    // vocabulary: Array[String]
+    size += SizeEstimator.estimate(vocabulary)
+    size
+  }
 
   @Since("1.5.0")
   def this(vocabulary: Array[String]) = {

@@ -18,6 +18,7 @@
 """
 A loc indexer for pandas-on-Spark DataFrame/Series.
 """
+
 from abc import ABCMeta, abstractmethod
 from collections.abc import Iterable
 from functools import reduce
@@ -64,9 +65,9 @@ class IndexerLike:
         from pyspark.pandas.frame import DataFrame
         from pyspark.pandas.series import Series
 
-        assert isinstance(
-            psdf_or_psser, (DataFrame, Series)
-        ), "unexpected argument type: {}".format(type(psdf_or_psser))
+        assert isinstance(psdf_or_psser, (DataFrame, Series)), (
+            "unexpected argument type: {}".format(type(psdf_or_psser))
+        )
         self._psdf_or_psser = psdf_or_psser
 
     @property
@@ -535,6 +536,12 @@ class LocIndexerLike(IndexerLike, metaclass=ABCMeta):
                 else:
                     sdf = sdf.limit(sdf.count() + limit)
                 sdf = sdf.drop(NATURAL_ORDER_COLUMN_NAME)
+
+            if is_remote():
+                # Trigger plan analysis on Spark Connect here so analysis errors are caught
+                # before `InternalFrame.__init__`. `isStreaming` also caches the value used
+                # by `InternalFrame.__init__` immediately after.
+                sdf.isStreaming
         except AnalysisException:
             if is_remote():
                 from pyspark.sql.connect.column import Column as ConnectColumn
@@ -621,22 +628,23 @@ class LocIndexerLike(IndexerLike, metaclass=ABCMeta):
                     psdf[temp_value_col] = value
                 psdf = psdf.sort_values(temp_natural_order).drop(columns=temp_natural_order)
 
-                psser = psdf._psser_for(column_label)
                 if isinstance(key, Series):
-                    key = F.col(
-                        "`{}`".format(psdf[temp_key_col]._internal.data_spark_column_names[0])
-                    )
+                    key = psdf[temp_key_col].spark.column
                 if isinstance(value, Series):
-                    value = F.col(
-                        "`{}`".format(psdf[temp_value_col]._internal.data_spark_column_names[0])
-                    )
+                    value = psdf[temp_value_col].spark.column
 
-                type(self)(psser)[key] = value
+                if isinstance(self, iLocIndexer):
+                    col_sel = psdf._internal.column_labels.index(column_label)
+                else:
+                    col_sel = column_label
+                type(self)(psdf)[key, col_sel] = value
+
+                psser = psdf._psser_for(column_label)
 
                 if self._psdf_or_psser.name is None:
                     psser = psser.rename()
 
-                self._psdf_or_psser._psdf._update_internal_frame(
+                self._psdf_or_psser._update_internal_frame(
                     psser._psdf[
                         self._psdf_or_psser._psdf._internal.column_labels
                     ]._internal.resolved_copy,
@@ -671,9 +679,10 @@ class LocIndexerLike(IndexerLike, metaclass=ABCMeta):
             )
 
             internal = self._internal.with_new_spark_column(
-                self._psdf_or_psser._column_label, scol  # TODO: dtype?
+                self._psdf_or_psser._column_label,
+                scol,  # TODO: dtype?
             )
-            self._psdf_or_psser._psdf._update_internal_frame(internal, check_same_anchor=False)
+            self._psdf_or_psser._update_internal_frame(internal, check_same_anchor=False)
         else:
             assert self._is_df
 
@@ -775,7 +784,7 @@ class LocIndexerLike(IndexerLike, metaclass=ABCMeta):
                         if label in selected_column_labels_set
                     ]
                     if selected_column_labels != selected_labels_in_internal_order:
-                        # If requested columns are in different order than the DataFrame’s internal order,
+                        # If requested columns are in different order than the DataFrame's internal order,
                         # it returns early (no-op), matching pandas 3 behavior for that edge case.
                         return
                 value = F.lit(value)
@@ -821,11 +830,7 @@ class LocIndexerLike(IndexerLike, metaclass=ABCMeta):
             internal = self._internal.with_new_columns(
                 new_data_spark_columns, column_labels=column_labels, data_fields=new_fields
             )
-            self._psdf_or_psser._update_internal_frame(
-                internal,
-                check_same_anchor=False,
-                anchor_force_disconnect=LooseVersion(pd.__version__) >= "3.0.0",
-            )
+            self._psdf_or_psser._update_internal_frame(internal, check_same_anchor=False)
 
 
 class LocIndexer(LocIndexerLike):
@@ -1872,7 +1877,7 @@ class iLocIndexer(LocIndexerLike):
                         )
         super().__setitem__(key, value)
         # Update again with resolved_copy to drop extra columns.
-        self._psdf._update_internal_frame(
+        self._psdf_or_psser._update_internal_frame(
             self._psdf._internal.resolved_copy, check_same_anchor=False
         )
 
@@ -1904,7 +1909,7 @@ def _test() -> None:
         .appName("pyspark.pandas.indexing tests")
         .getOrCreate()
     )
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.pandas.indexing,
         globs=globs,
         optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE,

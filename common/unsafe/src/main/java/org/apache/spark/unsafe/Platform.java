@@ -43,6 +43,10 @@ public final class Platform {
 
   public static final int DOUBLE_ARRAY_OFFSET;
 
+  // Field offset for java.nio.Buffer.address — used to read the native memory address
+  // of a DirectByteBuffer without going through sun.nio.ch.DirectBuffer.
+  private static final long DIRECT_BUFFER_ADDRESS_OFFSET;
+
   private static final boolean unaligned;
 
   // Split java.version on non-digit chars:
@@ -77,16 +81,26 @@ public final class Platform {
 
       // no point continuing if the above failed:
       if (DBB_CONSTRUCTOR != null && DBB_CLEANER_FIELD != null) {
-        Class<?> cleanerClass = Class.forName("jdk.internal.ref.Cleaner");
-        Method createMethod = cleanerClass.getMethod("create", Object.class, Runnable.class);
-        // Accessing jdk.internal.ref.Cleaner should actually fail by default in JDK 9+,
-        // unfortunately, unless the user has allowed access with something like
-        // --add-opens java.base/jdk.internal.ref=ALL-UNNAMED  If not, we can't use the Cleaner
-        // hack below. It doesn't break, just means the user might run into the default JVM limit
-        // on off-heap memory and increase it or set the flag above. This tests whether it's
-        // available:
+        // JDK-8344332 (JDK 26) migrate DirectByteBuffer away from jdk.internal.ref.Cleaner
+        Class<?> cleanerClass = (majorVersion < 26) ?
+            Class.forName("jdk.internal.ref.Cleaner") :
+            Class.forName("java.nio.BufferCleaner");
+        Method createMethod = (majorVersion < 26) ?
+            cleanerClass.getMethod("create", Object.class, Runnable.class) :
+            cleanerClass.getMethod("register", Object.class, Runnable.class);
+        // Accessing jdk.internal.ref.Cleaner (JDK 9~25) / java.nio.BufferCleaner (JDK 26+)
+        // should actually fail by default, unless the user has allowed access with something like
+        //   --add-opens java.base/jdk.internal.ref=ALL-UNNAMED  (JDK 9~25)
+        //   --add-opens java.base/java.nio=ALL-UNNAMED          (JDK 26+)
+        // If not, we can't use the Cleaner hack below. It doesn't break, just means the user might
+        // run into the default JVM limit on off-heap memory and increase it or set the flag above.
+        // This tests whether it's available:
         try {
-          createMethod.invoke(null, null, null);
+          if (createMethod.trySetAccessible()) {
+            createMethod.invoke(null, new Object(), (Runnable) () -> {});
+          } else {
+            createMethod = null;
+          }
         } catch (IllegalAccessException e) {
           // Don't throw an exception, but can't log here?
           createMethod = null;
@@ -230,6 +244,14 @@ public final class Platform {
     throw new IllegalStateException("unreachable");
   }
 
+  /**
+   * Returns the native memory address of a direct {@link ByteBuffer}.
+   * The buffer must be direct; passing a heap buffer produces an undefined result.
+   */
+  public static long getDirectBufferAddress(ByteBuffer buffer) {
+    return _UNSAFE.getLong(buffer, DIRECT_BUFFER_ADDRESS_OFFSET);
+  }
+
   public static void setMemory(Object object, long offset, long size, byte value) {
     _UNSAFE.setMemory(object, offset, size, value);
   }
@@ -296,6 +318,12 @@ public final class Platform {
       LONG_ARRAY_OFFSET = _UNSAFE.arrayBaseOffset(long[].class);
       FLOAT_ARRAY_OFFSET = _UNSAFE.arrayBaseOffset(float[].class);
       DOUBLE_ARRAY_OFFSET = _UNSAFE.arrayBaseOffset(double[].class);
+      try {
+        DIRECT_BUFFER_ADDRESS_OFFSET =
+          _UNSAFE.objectFieldOffset(java.nio.Buffer.class.getDeclaredField("address"));
+      } catch (NoSuchFieldException e) {
+        throw new IllegalStateException(e);
+      }
     } else {
       BOOLEAN_ARRAY_OFFSET = 0;
       BYTE_ARRAY_OFFSET = 0;
@@ -304,6 +332,7 @@ public final class Platform {
       LONG_ARRAY_OFFSET = 0;
       FLOAT_ARRAY_OFFSET = 0;
       DOUBLE_ARRAY_OFFSET = 0;
+      DIRECT_BUFFER_ADDRESS_OFFSET = 0;
     }
   }
 

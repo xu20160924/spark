@@ -207,7 +207,7 @@ private[hive] class SparkGetColumnsOperation(
           pos + 1
         }
         val rowData = Array[AnyRef](
-          null, // TABLE_CAT
+          sessionCatalogTableCat(null), // TABLE_CAT
           dbName, // TABLE_SCHEM
           tableName, // TABLE_NAME
           column.name, // COLUMN_NAME
@@ -224,7 +224,7 @@ private[hive] class SparkGetColumnsOperation(
           null, // SQL_DATETIME_SUB
           null, // CHAR_OCTET_LENGTH
           ordinal.asInstanceOf[AnyRef], // ORDINAL_POSITION, 1-based
-          "YES", // IS_NULLABLE
+          (if (column.nullable) "YES" else "NO"), // IS_NULLABLE
           null, // SCOPE_CATALOG
           null, // SCOPE_SCHEMA
           null, // SCOPE_TABLE

@@ -21,6 +21,7 @@ import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.trees.Origin
 import org.apache.spark.sql.catalyst.util.QuotingUtils
 import org.apache.spark.sql.catalyst.util.QuotingUtils.toSQLSchema
+import org.apache.spark.sql.internal.SqlApiConf
 import org.apache.spark.sql.types.{DataType, Decimal, StringType}
 import org.apache.spark.unsafe.types.UTF8String
 
@@ -78,8 +79,23 @@ private[sql] object DataTypeErrors extends DataTypeErrorsBase {
 
   def cannotLoadUserDefinedTypeError(name: String, userClass: String): Throwable = {
     new SparkException(
-      errorClass = "_LEGACY_ERROR_TEMP_2228",
-      messageParameters = Map("name" -> name, "userClass" -> userClass),
+      errorClass = "UDT_CLASS_NOT_FOUND.FOR_USER_CLASS",
+      messageParameters = Map("udtClass" -> name, "userClass" -> userClass),
+      cause = null)
+  }
+
+  def udtClassLoadingDisabledError(udtClass: String, allowed: Seq[String]): Throwable = {
+    new SparkException(
+      errorClass = "UDT_CLASS_LOADING_DISABLED",
+      messageParameters =
+        Map("udtClass" -> udtClass, "allowed" -> allowed.map(toSQLValue).mkString(", ")),
+      cause = null)
+  }
+
+  def udtClassNotUserDefinedTypeError(udtClass: String): Throwable = {
+    new SparkException(
+      errorClass = "UDT_CLASS_NOT_USER_DEFINED_TYPE",
+      messageParameters = Map("udtClass" -> udtClass),
       cause = null)
   }
 
@@ -273,6 +289,29 @@ private[sql] object DataTypeErrors extends DataTypeErrorsBase {
     new SparkException(
       errorClass = "UNSUPPORTED_TIME_PRECISION",
       messageParameters = Map("precision" -> precision.toString),
+      cause = null)
+  }
+
+  def invalidTimestampPrecisionError(precision: String, typeName: String): Throwable = {
+    new SparkException(
+      errorClass = "INVALID_TIMESTAMP_PRECISION",
+      messageParameters = Map("precision" -> precision, "type" -> typeName),
+      cause = null)
+  }
+
+  def checkTimestampNanosTypesEnabled(): Unit = {
+    if (!SqlApiConf.get.timestampNanosTypesEnabled) {
+      throw timestampNanosTypesNotEnabledError()
+    }
+  }
+
+  def timestampNanosTypesNotEnabledError(): Throwable = {
+    new SparkException(
+      errorClass = "FEATURE_NOT_ENABLED",
+      messageParameters = Map(
+        "featureName" -> "Nanosecond-precision timestamp types",
+        "configKey" -> "spark.sql.timestampNanosTypes.enabled",
+        "configValue" -> "true"),
       cause = null)
   }
 }

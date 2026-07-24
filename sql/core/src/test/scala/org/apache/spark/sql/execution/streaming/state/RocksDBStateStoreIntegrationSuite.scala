@@ -114,9 +114,12 @@ class RocksDBStateStoreIntegrationSuite extends StreamTest
               "SnapshotLastUploaded.partition_0_default", "rocksdbChangeLogWriterCommitLatencyMs",
               "rocksdbSaveZipFilesLatencyMs", "rocksdbLoadFromSnapshotLatencyMs",
               "rocksdbLoadLatencyMs", "rocksdbReplayChangeLogLatencyMs",
-              "rocksdbNumReplayChangelogFiles", "rocksdbForceSnapshotCount"))
+              "rocksdbNumReplayChangelogFiles", "rocksdbForceSnapshotCount",
+              "rocksdbNumLoadedFromDfs"))
             assert(stateOperatorMetrics.customMetrics.get("rocksdbNumSnapshotsAutoRepaired") == 0,
               "Should be 0 since we didn't repair any snapshot")
+            assert(stateOperatorMetrics.customMetrics.get("rocksdbNumLoadedFromDfs") == 0,
+              "Should be 0 since state is served from local cache")
           }
         } finally {
           query.stop()
@@ -395,6 +398,17 @@ class RocksDBStateStoreIntegrationSuite extends StreamTest
         (SQLConf.SHUFFLE_PARTITIONS.key -> "2"), // Use 2 partitions to test multiple providers
         (s"${RocksDBConf.ROCKSDB_SQL_CONF_NAME_PREFIX}.boundedMemoryUsage" -> "true")) {
 
+        // Fully unload state store providers left over from previous tests before touching the
+        // global RocksDBMemoryManager singleton. A preceding test may still be asynchronously
+        // tearing down its (unbounded) query when this test starts; its providers only call
+        // RocksDBMemoryManager.unregisterInstance() from RocksDBStateStoreProvider.close(), which
+        // StreamTest does not force between tests (only afterAll() calls StateStore.stop()). If a
+        // lingering unbounded provider re-reports its memory usage after the reset below, it stays
+        // in the singleton and the "0 unbounded instances" assertion flakes (observed as
+        // "1 did not equal 0", especially under the row-checksum variant whose extra per-row work
+        // widens the teardown window). Stopping first makes close()/unregister run synchronously.
+        StateStore.stop()
+
         // Clear any existing providers from previous tests
         RocksDBMemoryManager.resetWriteBufferManagerAndCache
 
@@ -410,17 +424,16 @@ class RocksDBStateStoreIntegrationSuite extends StreamTest
           .start()
 
         try {
-          // Initially no providers should be registered
-          assert(RocksDBMemoryManager.getNumRocksDBInstances(true) == 0)
-
           // Add data to trigger state store creation
           inputData.addData(1, 2, 3, 4)
           query.processAllAvailable()
 
-          // With 2 partitions, we should have 2 bounded memory providers registered
-          assert(RocksDBMemoryManager.getNumRocksDBInstances(true) == 2)
-
-          assert(RocksDBMemoryManager.getNumRocksDBInstances(false) == 0)
+          // With 2 partitions and bounded memory enabled, we should have
+          // 2 bounded memory providers registered and no unbounded ones
+          eventually(timeout(Span(10, Seconds)), interval(Span(500, Millis))) {
+            assert(RocksDBMemoryManager.getNumRocksDBInstances(true) == 2)
+            assert(RocksDBMemoryManager.getNumRocksDBInstances(false) == 0)
+          }
 
           // Add more data and check providers remain registered
           inputData.addData(5, 6, 7, 8)

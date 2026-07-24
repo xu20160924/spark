@@ -2387,7 +2387,8 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
   "errorClass" : "UNSUPPORTED_EXPR_FOR_OPERATOR",
   "sqlState" : "42K0E",
   "messageParameters" : {
-    "invalidExprSqls" : "\"max(col1)\""
+    "invalidExprSqls" : "\"max(col1)\"",
+    "operator" : "Sort"
   },
   "queryContext" : [ {
     "objectType" : "",
@@ -2428,7 +2429,8 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
   "errorClass" : "UNSUPPORTED_EXPR_FOR_OPERATOR",
   "sqlState" : "42K0E",
   "messageParameters" : {
-    "invalidExprSqls" : "\"max(col1)\""
+    "invalidExprSqls" : "\"max(col1)\"",
+    "operator" : "Sort"
   },
   "queryContext" : [ {
     "objectType" : "",
@@ -2897,7 +2899,8 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
   "errorClass" : "UNSUPPORTED_EXPR_FOR_OPERATOR",
   "sqlState" : "42K0E",
   "messageParameters" : {
-    "invalidExprSqls" : "\"max(col1)\""
+    "invalidExprSqls" : "\"max(col1)\"",
+    "operator" : "Sort"
   },
   "queryContext" : [ {
     "objectType" : "",
@@ -2938,7 +2941,8 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
   "errorClass" : "UNSUPPORTED_EXPR_FOR_OPERATOR",
   "sqlState" : "42K0E",
   "messageParameters" : {
-    "invalidExprSqls" : "\"max(col1)\""
+    "invalidExprSqls" : "\"max(col1)\"",
+    "operator" : "Sort"
   },
   "queryContext" : [ {
     "objectType" : "",
@@ -3142,10 +3146,10 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
 -- !query
 DROP VIEW IF EXISTS v1
 -- !query analysis
-DropTempViewCommand v1
+DropTempViewCommand v1, true
 
 
 -- !query
 DROP VIEW IF EXISTS v2
 -- !query analysis
-DropTempViewCommand v2
+DropTempViewCommand v2, true

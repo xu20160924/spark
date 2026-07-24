@@ -35,7 +35,7 @@ import org.apache.spark.internal.LogKeys._
 import org.apache.spark.internal.config._
 import org.apache.spark.scheduler.SchedulingMode._
 import org.apache.spark.util.{AccumulatorV2, Clock, LongAccumulator, SystemClock, Utils}
-import org.apache.spark.util.collection.PercentileHeap
+import org.apache.spark.util.collection.{OpenHashSet, PercentileHeap}
 
 /**
  * Schedules the tasks within a single TaskSet in the TaskSchedulerImpl. This class keeps track of
@@ -199,6 +199,12 @@ private[spark] class TaskSetManager(
 
   // Task index, start and finish time for each task attempt (indexed by task ID)
   private[scheduler] val taskInfos = new HashMap[Long, TaskInfo]
+
+  // Reverse index: executor ID -> set of task IDs that were launched on that executor.
+  // This includes both running and completed tasks, used to efficiently look up tasks
+  // when an executor is lost, avoiding O(N) scans over all taskInfos.
+  // Uses OpenHashSet[Long] (specialized for Long) to avoid boxing overhead.
+  private[scheduler] val executorIdToTaskIds = new HashMap[String, OpenHashSet[Long]]
 
   // Use a MedianHeap to record durations of successful tasks so we know when to launch
   // speculative tasks. This is only used when speculation is enabled, to avoid the overhead
@@ -537,6 +543,7 @@ private[spark] class TaskSetManager(
       taskId, index, attemptNum, task.partitionId, launchTime,
       execId, host, taskLocality, speculative)
     taskInfos(taskId) = info
+    executorIdToTaskIds.getOrElseUpdate(execId, new OpenHashSet[Long]).add(taskId)
     taskAttempts(index) = info :: taskAttempts(index)
     // Serialize and return the task
     val serializedTask: ByteBuffer = try {
@@ -817,6 +824,8 @@ private[spark] class TaskSetManager(
     val index = info.index
     // Check if any other attempt succeeded before this and this attempt has not been handled
     if (successful(index) && killedByOtherAttempt.contains(tid)) {
+      // For ShuffleMapTasks, detect speculation duplicate before handling as killed.
+      detectStalePushIfShuffleTask(tid, info.index, result)
       // Undo the effect on calculatedTasks and totalResultSize made earlier when
       // checking if can fetch more results
       calculatedTasks -= 1
@@ -921,6 +930,34 @@ private[spark] class TaskSetManager(
     }
     sched.dagScheduler.taskEnded(task, reason, result, accumUpdates, metricPeaks,
       taskInfoWithAccumulables)
+  }
+
+  /**
+   * For ShuffleMapTasks, detect stale push: if a partition already has
+   * a registered MapStatus with a different mapId, it means another attempt for the same
+   * partition also pushed data to the merger. Mark this partition so that reducers will
+   * skip the merged block and fallback to unmerged blocks.
+   *
+   * This is called from handleSuccessfulTask for late-arriving or killed attempt results,
+   * where the task result won't be forwarded to DAGScheduler (so DAGScheduler's own
+   * stale detection won't cover these cases).
+   */
+  private def detectStalePushIfShuffleTask(
+      tid: Long, index: Int, result: DirectTaskResult[_]): Unit = {
+    if (!isShuffleMapTasks || shuffleId.isEmpty) {
+      return
+    }
+    // This method is only called for late-arriving or killed attempts, meaning the partition
+    // already has a successful attempt registered. Any MapStatus arriving here is from a
+    // stale (redundant) attempt that also pushed data to the merger.
+    val mapStatus = result.value().asInstanceOf[MapStatus]
+    val sid = shuffleId.get
+    val partitionId = tasks(index).partitionId
+    // Mark its mapIndex (== partitionId, NOT MapStatus.mapId) as stale so reducers can detect
+    // the stale data in merged block chunks via chunkBitmaps and fallback if needed.
+    logInfo(s"[StalePush] Late/killed attempt tid=$tid for partition=$partitionId " +
+      s"(index=$index), attemptMapId=${mapStatus.mapId}. Marked as stale push.")
+    sched.mapOutputTracker.markStalePushedPartition(sid, partitionId)
   }
 
   private[scheduler] def markPartitionCompleted(partitionId: Int): Unit = {
@@ -1050,6 +1087,12 @@ private[spark] class TaskSetManager(
           log"Not counting this failure towards the maximum number of failures for the task.")
         None
 
+      case _: ExecutorShutdownFailure =>
+        logInfo(log"${MDC(TASK_NAME, taskName(tid))} failed because its executor was shutting" +
+          log" down while the task was being launched." +
+          log" Not counting this failure towards the maximum number of failures for the task.")
+        None
+
       case _: TaskFailedReason =>  // TaskResultLost and others
         logWarning(failureReason)
         None
@@ -1141,6 +1184,7 @@ private[spark] class TaskSetManager(
 
   /** Called by TaskScheduler when an executor is lost so we can re-enqueue our tasks */
   override def executorLost(execId: String, host: String, reason: ExecutorLossReason): Unit = {
+    val taskIdsOnExec = executorIdToTaskIds.getOrElse(execId, TaskSetManager.EMPTY_LONG_SET)
     // Re-enqueue any tasks with potential shuffle data loss that ran on the failed executor
     // if this is a shuffle map stage, and we are not using an external shuffle server which
     // could serve the shuffle outputs or the executor lost is caused by decommission (which
@@ -1150,7 +1194,10 @@ private[spark] class TaskSetManager(
       !sched.sc.shuffleDriverComponents.supportsReliableStorage() &&
       (reason.isInstanceOf[ExecutorDecommission] || !env.blockManager.externalShuffleServiceEnabled)
     if (maybeShuffleMapOutputLoss && !isZombie) {
-      for ((tid, info) <- taskInfos if info.executorId == execId) {
+      val iter1 = taskIdsOnExec.iterator
+      while (iter1.hasNext) {
+        val tid = iter1.next()
+        val info = taskInfos(tid)
         val index = info.index
         lazy val isShuffleMapOutputAvailable = reason match {
           case ExecutorDecommission(_, _) =>
@@ -1192,18 +1239,23 @@ private[spark] class TaskSetManager(
         }
       }
     }
-    for ((tid, info) <- taskInfos if info.running && info.executorId == execId) {
-      val exitCausedByApp: Boolean = reason match {
-        case ExecutorExited(_, false, _) => false
-        case ExecutorKilled | ExecutorDecommission(_, _) => false
-        case ExecutorProcessLost(_, _, false) => false
-        // If the task is launching, this indicates that Driver has sent LaunchTask to Executor,
-        // but Executor has not sent StatusUpdate(TaskState.RUNNING) to Driver. Hence, we assume
-        // that the task is not running, and it is NetworkFailure rather than TaskFailure.
-        case _ => !info.launching
+    val iter2 = taskIdsOnExec.iterator
+    while (iter2.hasNext) {
+      val tid = iter2.next()
+      val info = taskInfos(tid)
+      if (info.running) {
+        val exitCausedByApp: Boolean = reason match {
+          case ExecutorExited(_, false, _) => false
+          case ExecutorKilled | ExecutorDecommission(_, _) => false
+          case ExecutorProcessLost(_, _, false) => false
+          // If the task is launching, this indicates that Driver has sent LaunchTask to Executor,
+          // but Executor has not sent StatusUpdate(TaskState.RUNNING) to Driver. Hence, we assume
+          // that the task is not running, and it is NetworkFailure rather than TaskFailure.
+          case _ => !info.launching
+        }
+        handleFailedTask(tid, TaskState.FAILED, ExecutorLostFailure(info.executorId,
+          exitCausedByApp, Some(reason.toString)))
       }
-      handleFailedTask(tid, TaskState.FAILED, ExecutorLostFailure(info.executorId, exitCausedByApp,
-        Some(reason.toString)))
     }
     // recalculate valid locality levels and waits when executor is lost
     recomputeLocality()
@@ -1448,6 +1500,10 @@ private[spark] object TaskSetManager {
 
   // 1 minute
   val BARRIER_LOGGING_INTERVAL = 60000
+
+  // Shared empty set used as default value for executorIdToTaskIds lookups
+  // to avoid allocating a new empty set on each executorLost call.
+  private val EMPTY_LONG_SET = new OpenHashSet[Long](0)
 }
 
 /**

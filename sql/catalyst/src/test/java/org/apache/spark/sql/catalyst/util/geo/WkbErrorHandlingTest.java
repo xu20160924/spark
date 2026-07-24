@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.catalyst.util.geo;
 
+import org.apache.spark.SparkIllegalArgumentException;
+import org.apache.spark.sql.catalyst.util.Geometry;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
@@ -46,13 +48,12 @@ public class WkbErrorHandlingTest extends WkbTestBase {
     WkbParseException ex = Assertions.assertThrows(
         WkbParseException.class, () -> reader.read(wkb),
         "Should throw WkbParseException for WKB: " + hex);
-    Assertions.assertTrue(ex.getMessage().toUpperCase().contains(hex.toUpperCase()),
-        "Exception message should contain the WKB hex: " + hex + ", actual: " + ex.getMessage());
+    Assertions.assertSame(wkb, ex.getWkb());
     if (expectedMessagePart != null && !expectedMessagePart.isEmpty()) {
       Assertions.assertTrue(
-          ex.getMessage().toLowerCase().contains(expectedMessagePart.toLowerCase()),
+          ex.getParseError().toLowerCase().contains(expectedMessagePart.toLowerCase()),
           "Exception message should contain '" + expectedMessagePart + "', actual: " +
-              ex.getMessage());
+              ex.getParseError());
     }
   }
 
@@ -63,69 +64,104 @@ public class WkbErrorHandlingTest extends WkbTestBase {
     WkbParseException ex = Assertions.assertThrows(
       WkbParseException.class, () -> reader.read(emptyWkb));
     // Empty WKB produces empty hex string, so just verify exception was thrown
-    Assertions.assertNotNull(ex.getMessage());
+    Assertions.assertNotNull(ex.getParseError());
   }
 
   @Test
   public void testTooShortWkb() {
     // Only endianness byte
-    String hex = "01";
-    byte[] tooShort = hexToBytes(hex);
+    byte[] tooShort = hexToBytes("01");
     WkbReader reader = new WkbReader();
     WkbParseException ex = Assertions.assertThrows(
       WkbParseException.class, () -> reader.read(tooShort));
-    Assertions.assertTrue(ex.getMessage().toUpperCase().contains(hex.toUpperCase()),
-      "Exception message should contain the WKB hex: " + hex);
+    Assertions.assertSame(tooShort, ex.getWkb());
   }
 
   @Test
   public void testInvalidGeometryTypeZero() {
     // Type = 0 (invalid, should be 1-7)
-    String hex = "0100000000000000000000F03F0000000000000040";
-    byte[] invalidType = hexToBytes(hex);
+    byte[] invalidType = hexToBytes("0100000000000000000000F03F0000000000000040");
     WkbReader reader = new WkbReader();
     WkbParseException ex = Assertions.assertThrows(
       WkbParseException.class, () -> reader.read(invalidType));
-    Assertions.assertTrue(ex.getMessage().toUpperCase().contains(hex.toUpperCase()),
-      "Exception message should contain the WKB hex: " + hex);
+    Assertions.assertSame(invalidType, ex.getWkb());
   }
 
   @Test
   public void testTruncatedPointCoordinates() {
     // Point WKB with truncated coordinates (missing Y coordinate)
-    String hex = "0101000000000000000000F03F";
-    byte[] truncated = hexToBytes(hex);
+    byte[] truncated = hexToBytes("0101000000000000000000F03F");
     WkbReader reader = new WkbReader();
     WkbParseException ex = Assertions.assertThrows(
       WkbParseException.class, () -> reader.read(truncated));
-    Assertions.assertTrue(ex.getMessage().toUpperCase().contains(hex.toUpperCase()),
-      "Exception message should contain the WKB hex: " + hex);
+    Assertions.assertSame(truncated, ex.getWkb());
   }
 
   @Test
   public void testTruncatedByte() {
     // Only one byte (FF) of the 4-byte INT field.
-    String hex = "0102000000ff";
-    byte[] truncated = hexToBytes(hex);
+    byte[] truncated = hexToBytes("0102000000ff");
     WkbReader reader = new WkbReader();
     WkbParseException ex = Assertions.assertThrows(
       WkbParseException.class, () -> reader.read(truncated));
-    Assertions.assertTrue(ex.getMessage().toUpperCase().contains(hex.toUpperCase()),
-      "Exception message should contain the WKB hex: " + hex);
+    Assertions.assertSame(truncated, ex.getWkb());
   }
 
   @Test
   public void testTruncatedLineString() {
     // LineString with declared 2 points but only 1 provided
-    String hex = "010200000002000000" +  // LineString with 2 points
-      "0000000000000000" +              // X of first point
-      "0000000000000000";               // Y of first point (missing second point)
-    byte[] truncated = hexToBytes(hex);
+    byte[] truncated = hexToBytes(
+      "010200000002000000" +  // LineString with 2 points
+      "0000000000000000" +    // X of first point
+      "0000000000000000");    // Y of first point (missing second point)
     WkbReader reader = new WkbReader();
     WkbParseException ex = Assertions.assertThrows(
       WkbParseException.class, () -> reader.read(truncated));
-    Assertions.assertTrue(ex.getMessage().toUpperCase().contains(hex.toUpperCase()),
-      "Exception message should contain the WKB hex: " + hex);
+    Assertions.assertSame(truncated, ex.getWkb());
+  }
+
+  @Test
+  public void testNegativeElementCounts() {
+    String[] invalidCounts = new String[] {
+      "0102000000ffffffff",          // LineString with -1 points
+      "010300000001000000ffffffff",  // Polygon ring with -1 points
+      "0103000000ffffffff",          // Polygon with -1 rings
+      "0104000000ffffffff",          // MultiPoint with -1 points
+      "0105000000ffffffff",          // MultiLineString with -1 linestrings
+      "0106000000ffffffff",          // MultiPolygon with -1 polygons
+      "0107000000ffffffff"           // GeometryCollection with -1 geometries
+    };
+
+    for (String invalidCount : invalidCounts) {
+      assertParseError(invalidCount, "Invalid count");
+    }
+  }
+
+  @Test
+  public void testElementCountsExceedRemainingBytes() {
+    String[] invalidCounts = new String[] {
+      "0102000000ffffff7f",          // LineString with too many points
+      "010300000001000000ffffff7f",  // Polygon ring with too many points
+      "0103000000ffffff7f",          // Polygon with too many rings
+      "0104000000ffffff7f",          // MultiPoint with too many points
+      "0105000000ffffff7f",          // MultiLineString with too many linestrings
+      "0106000000ffffff7f",          // MultiPolygon with too many polygons
+      "0107000000ffffff7f"           // GeometryCollection with too many geometries
+    };
+
+    for (String invalidCount : invalidCounts) {
+      assertParseError(invalidCount, "Invalid count");
+    }
+  }
+
+  @Test
+  public void testGeometryFromWkbRejectsInvalidCount() {
+    byte[] wkb = hexToBytes("0102000000ffffffff");
+    SparkIllegalArgumentException ex = Assertions.assertThrows(
+      SparkIllegalArgumentException.class, () -> Geometry.fromWkb(wkb));
+
+    Assertions.assertEquals("WKB_PARSE_ERROR", ex.getCondition());
+    Assertions.assertTrue(ex.getMessage().contains("Invalid count"));
   }
 
   @Test
@@ -164,8 +200,7 @@ public class WkbErrorHandlingTest extends WkbTestBase {
 
     WkbParseException ex = Assertions.assertThrows(
       WkbParseException.class, () -> reader.read(invalidPolygon));
-    Assertions.assertTrue(ex.getMessage().toUpperCase().contains(hex.toUpperCase()),
-      "Exception message should contain the WKB hex: " + hex);
+    Assertions.assertSame(invalidPolygon, ex.getWkb());
   }
 
   @Test
@@ -174,20 +209,19 @@ public class WkbErrorHandlingTest extends WkbTestBase {
     WkbReader reader = new WkbReader(1);
 
     // Polygon with ring where first and last points don't match
-    String hex = "01" +                                      // Little endian
+    byte[] nonClosedRing = hexToBytes(
+      "01" +                                               // Little endian
       "03000000" +                                         // Polygon type
       "01000000" +                                         // 1 ring
       "04000000" +                                         // 4 points
       "0000000000000000" + "0000000000000000" +            // (0, 0)
       "000000000000F03F" + "0000000000000000" +            // (1, 0)
       "000000000000F03F" + "000000000000F03F" +            // (1, 1)
-      "0000000000000040" + "0000000000000040";             // (2, 2) - doesn't match first point!
-    byte[] nonClosedRing = hexToBytes(hex);
+      "0000000000000040" + "0000000000000040");            // (2, 2) - doesn't match first point!
 
     WkbParseException ex = Assertions.assertThrows(
       WkbParseException.class, () -> reader.read(nonClosedRing));
-    Assertions.assertTrue(ex.getMessage().toUpperCase().contains(hex.toUpperCase()),
-      "Exception message should contain the WKB hex: " + hex);
+    Assertions.assertSame(nonClosedRing, ex.getWkb());
   }
 
   @Test
@@ -197,7 +231,7 @@ public class WkbErrorHandlingTest extends WkbTestBase {
       WkbParseException.class, () -> reader.read(null),
       "Should throw WKBParseException for null byte array");
     // Null WKB cannot produce hex string, just verify exception was thrown
-    Assertions.assertNotNull(ex.getMessage());
+    Assertions.assertNotNull(ex.getParseError());
   }
 
   // ========== Invalid Byte Order Tests ==========

@@ -83,6 +83,30 @@ private[storage] class BlockInfo(
   }
   private[this] var _writerTask: Long = BlockInfo.NO_WRITER
 
+  // The three checksum fields below are `@volatile`: unlike the lock-guarded fields above, they are
+  // read/written across threads outside the block lock (e.g. a lockless `reportAllBlocks` heartbeat
+  // read, and a write under only a shared read lock in `localCopyMatchesSealedChecksum`), so they
+  // need their own visibility guarantee.
+
+  /**
+   * Content checksum of this block's serialized+compressed (pre-encryption) bytes, computed at
+   * store time when a checksum was requested for it. `None` when no checksum was computed.
+   */
+  @volatile var checksum: Option[Long] = None
+
+  /**
+   * Whether this block is subject to the read-side seal self-check (see `getLocalValues`). Set for
+   * blocks of RDDs with `verifyCheckpointChecksums` set; a block merely checksummed for observation
+   * is not.
+   */
+  @volatile var verifySealedChecksum: Boolean = false
+
+  /**
+   * Cached sealed checksum for this block, pulled from the master once on first read and reused.
+   * `None` until pulled, or if the block is not sealed.
+   */
+  @volatile var sealedChecksum: Option[Long] = None
+
   private def checkInvariants(): Unit = {
     // A block's reader count must be non-negative:
     assert(_readerCount >= 0)
@@ -178,6 +202,33 @@ private[storage] class BlockInfoManager(trackingCacheVisibility: Boolean = false
    * Tracks the set of blocks that each task has locked for writing.
    */
   private[this] val writeLocksByTask = new ConcurrentHashMap[TaskAttemptId, util.Set[BlockId]]
+
+  /**
+   * Register a write lock on `blockId` for `taskAttemptId`. This method creates a new entry
+   * for the task if none exist yet.
+   */
+  private def registerWriteLockForTask(taskAttemptId: TaskAttemptId, blockId: BlockId): Unit = {
+    writeLocksByTask.compute(taskAttemptId, (_, blockIds) => {
+      val newBlockIds = if (blockIds == null) {
+        util.Collections.synchronizedSet(new util.HashSet[BlockId])
+      } else {
+        blockIds
+      }
+      newBlockIds.add(blockId)
+      newBlockIds
+    })
+  }
+
+  /**
+   * Unregister a write lock on `blockId` for `taskAttemptId`. The entry for the task is
+   * cleaned up later by `releaseAllLocksForTask`.
+   */
+  private def unregisterWriteLockForTask(taskAttemptId: TaskAttemptId, blockId: BlockId): Unit = {
+    writeLocksByTask.computeIfPresent(taskAttemptId, (_, blockIds) => {
+      blockIds.remove(blockId)
+      blockIds
+    })
+  }
 
   /**
    * Tracks the set of blocks that each task has locked for reading, along with the number of times
@@ -333,7 +384,7 @@ private[storage] class BlockInfoManager(trackingCacheVisibility: Boolean = false
       val acquire = info.writerTask == BlockInfo.NO_WRITER && info.readerCount == 0
       if (acquire) {
         info.writerTask = taskAttemptId
-        writeLocksByTask.get(taskAttemptId).add(blockId)
+        registerWriteLockForTask(taskAttemptId, blockId)
         logTrace(s"Task $taskAttemptId acquired write lock for $blockId")
       }
       acquire
@@ -396,10 +447,10 @@ private[storage] class BlockInfoManager(trackingCacheVisibility: Boolean = false
     logTrace(s"Task $taskAttemptId releasing lock for $blockId")
     blockInfo(blockId) { (info, condition) =>
       if (info.writerTask != BlockInfo.NO_WRITER) {
-        val blockIds = writeLocksByTask.get(taskAttemptId)
+        val blockIds = writeLocksByTask.get(info.writerTask)
         if (blockIds != null) {
+          unregisterWriteLockForTask(info.writerTask, blockId)
           info.writerTask = BlockInfo.NO_WRITER
-          blockIds.remove(blockId)
         }
       } else {
         // There can be a race between unlock and releaseAllLocksForTask which causes negative
@@ -492,11 +543,10 @@ private[storage] class BlockInfoManager(trackingCacheVisibility: Boolean = false
     val writeLocks = Option(writeLocksByTask.remove(taskAttemptId)).getOrElse(util.Set.of())
     writeLocks.forEach { blockId =>
       blockInfo(blockId) { (info, condition) =>
-        // Check the existence of `blockId` because `unlock` may have already removed it
-        // concurrently.
-        if (writeLocks.contains(blockId)) {
+        // Check the existence of `blockId` and also if it is still held by this task because
+        // `unlock` may have already released it concurrently. See SPARK-53807 for details.
+        if (writeLocks.contains(blockId) && info.writerTask == taskAttemptId) {
           blocksWithReleasedLocks += blockId
-          assert(info.writerTask == taskAttemptId)
           info.writerTask = BlockInfo.NO_WRITER
           condition.signalAll()
         }
@@ -595,7 +645,7 @@ private[storage] class BlockInfoManager(trackingCacheVisibility: Boolean = false
         }
         info.readerCount = 0
         info.writerTask = BlockInfo.NO_WRITER
-        writeLocksByTask.get(taskAttemptId).remove(blockId)
+        unregisterWriteLockForTask(taskAttemptId, blockId)
       }
       condition.signalAll()
     }

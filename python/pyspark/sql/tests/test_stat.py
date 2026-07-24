@@ -28,6 +28,7 @@ from pyspark.sql.types import (
 from pyspark.errors import (
     AnalysisException,
     PySparkTypeError,
+    PySparkValueError,
 )
 from pyspark.testing.sqlutils import ReusedSQLTestCase
 
@@ -119,8 +120,22 @@ class DataFrameStatTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_LIST_OR_STR_OR_TUPLE",
-            messageParameters={"arg_name": "subset", "arg_type": "int"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "list, str or tuple",
+                "arg_name": "subset",
+                "arg_type": "int",
+            },
+        )
+
+        # Regression test: invalid 'how' should raise PySparkValueError, not AssertionError
+        with self.assertRaises(PySparkValueError) as pe:
+            self.spark.createDataFrame([("Alice", 50, 80.1)], schema).dropna(how="foo")
+
+        self.check_error(
+            exception=pe.exception,
+            errorClass="VALUE_NOT_ALLOWED",
+            messageParameters={"arg_name": "how", "allowed_values": "['any', 'all']"},
         )
 
     def test_fillna(self):
@@ -199,8 +214,12 @@ class DataFrameStatTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_BOOL_OR_DICT_OR_FLOAT_OR_INT_OR_STR",
-            messageParameters={"arg_name": "value", "arg_type": "list"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "bool, dict, float, int or str",
+                "arg_name": "value",
+                "arg_type": "list",
+            },
         )
 
         with self.assertRaises(PySparkTypeError) as pe:
@@ -208,8 +227,12 @@ class DataFrameStatTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_LIST_OR_TUPLE",
-            messageParameters={"arg_name": "subset", "arg_type": "int"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "list or tuple",
+                "arg_name": "subset",
+                "arg_type": "int",
+            },
         )
 
     def test_replace(self):
@@ -407,8 +430,12 @@ class DataFrameStatTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_BOOL_OR_DICT_OR_FLOAT_OR_INT_OR_LIST_OR_STR_OR_TUPLE",
-            messageParameters={"arg_name": "to_replace", "arg_type": "function"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "bool, dict, float, int, str or tuple",
+                "arg_name": "to_replace",
+                "arg_type": "function",
+            },
         )
 
     def test_unpivot(self):

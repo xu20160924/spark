@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 #
 # Licensed to the Apache Software Foundation (ASF) under one or more
 # contributor license agreements.  See the NOTICE file distributed with
@@ -23,7 +22,6 @@ import importlib
 import time
 from types import ModuleType
 from typing import Tuple, Union, List, Callable, Any, Type
-
 
 __all__: List[str] = []
 

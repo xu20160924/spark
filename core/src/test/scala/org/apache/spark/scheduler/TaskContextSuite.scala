@@ -23,7 +23,7 @@ import java.util.concurrent.atomic.AtomicInteger
 
 import scala.collection.mutable.ArrayBuffer
 
-import org.mockito.ArgumentMatchers.any
+import org.mockito.ArgumentMatchers.{any, eq => mockitoEq}
 import org.mockito.Mockito._
 import org.scalatest.BeforeAndAfter
 
@@ -148,6 +148,90 @@ class TaskContextSuite extends SparkFunSuite with BeforeAndAfter with LocalSpark
     assert(e.getMessage.contains("exception in listener1"))
     assert(e.getMessage.contains("exception in listener3"))
     assert(e.getMessage.contains("exception in task"))
+  }
+
+  test("all TaskInterruptListeners should be called even if some fail") {
+    val context = TaskContext.empty()
+    val listener = mock(classOf[TaskInterruptListener])
+    context.addTaskInterruptListener(new TaskInterruptListener {
+      override def onTaskInterrupted(context: TaskContext, reason: String): Unit =
+        throw new Exception("exception in listener1")
+    })
+    context.addTaskInterruptListener(listener)
+    context.addTaskInterruptListener(new TaskInterruptListener {
+      override def onTaskInterrupted(context: TaskContext, reason: String): Unit =
+        throw new Exception("exception in listener3")
+    })
+
+    // Interrupt listener failures mark the task failed but are not thrown from `markInterrupted`
+    // (kill / RPC thread must not see TaskCompletionListenerException).
+    context.markInterrupted("test interrupt")
+    assert(context.isFailed())
+
+    verify(listener, times(1)).onTaskInterrupted(any(), mockitoEq("test interrupt"))
+
+    val taskFailure = context.getTaskFailure.get
+    assert(taskFailure.isInstanceOf[TaskCompletionListenerException])
+    val e = taskFailure.asInstanceOf[TaskCompletionListenerException]
+    assert(e.getMessage.contains("exception in listener1"))
+    assert(e.getMessage.contains("exception in listener3"))
+    assert(e.getMessage.contains("test interrupt"))
+  }
+
+  test("immediately call an interrupt listener if the context is already interrupted") {
+    var invocations = 0
+    var lastReason: String = null
+    val context = TaskContext.empty()
+    context.markInterrupted("already interrupted")
+    context.addTaskInterruptListener(new TaskInterruptListener {
+      override def onTaskInterrupted(context: TaskContext, reason: String): Unit = {
+        invocations += 1
+        lastReason = reason
+      }
+    })
+    assert(invocations == 1)
+    assert(lastReason == "already interrupted")
+    context.addTaskInterruptListener(new TaskInterruptListener {
+      override def onTaskInterrupted(context: TaskContext, reason: String): Unit = {
+        invocations += 1
+      }
+    })
+    assert(invocations == 2)
+  }
+
+  test("SPARK-56330: task completion during interrupt listener execution") {
+    val context = TaskContext.empty()
+    val completionListener = mock(classOf[TaskCompletionListener])
+    context.addTaskCompletionListener(completionListener)
+
+    // Add a task interrupt listener that blocks until released.
+    val interruptListenerStarted = new Semaphore(0)
+    val interruptListenerRelease = new Semaphore(0)
+    context.addTaskInterruptListener(new TaskInterruptListener {
+      override def onTaskInterrupted(context: TaskContext, reason: String): Unit = {
+        interruptListenerStarted.release()
+        interruptListenerRelease.acquire()
+      }
+    })
+
+    // Interrupt the task from a separate thread and wait until the interrupt listener starts.
+    val interruptThread = new Thread(() => context.markInterrupted("test interrupt"))
+    interruptThread.start()
+    interruptListenerStarted.acquire()
+
+    // While the interrupt listener is running on the interrupt thread, mark the task completed
+    // on this thread. With the dedicated interrupt listener loop, this must NOT be blocked.
+    context.markTaskCompleted(None)
+
+    // The completion listener should have been called even though the interrupt listener is still
+    // running. If `invokeListeners()` were shared between interrupt and completion listeners,
+    // the completion listener would be silently skipped because `listenerInvocationThread` would
+    // be held by the interrupt thread.
+    verify(completionListener, times(1)).onTaskCompletion(any())
+
+    // Release the interrupt listener and join the interrupt thread.
+    interruptListenerRelease.release()
+    interruptThread.join()
   }
 
   test("FailureListener throws after task body fails") {
@@ -682,6 +766,76 @@ class TaskContextSuite extends SparkFunSuite with BeforeAndAfter with LocalSpark
     context.markTaskFailed(new RuntimeException())
     context.markTaskCompleted(None)
     assert(isFailed)
+  }
+
+  test("SPARK-57491: invokePostStatusUpdateListeners triggers PostStatusUpdateListener") {
+    // Basic invocation - listener is called when invokePostStatusUpdateListeners is invoked
+    val context1 = TaskContext.empty()
+    var invoked = false
+    context1.addPostStatusUpdateListener(new PostStatusUpdateListener {
+      override def onStatusUpdateSent(context: TaskContext): Unit = invoked = true
+    })
+    assert(!invoked)
+    context1.invokePostStatusUpdateListeners()
+    assert(invoked)
+
+    // Multiple listeners are called in reverse registration order
+    val context2 = TaskContext.empty()
+    val callOrder = ArrayBuffer.empty[String]
+    context2.addPostStatusUpdateListener(new PostStatusUpdateListener {
+      override def onStatusUpdateSent(context: TaskContext): Unit = callOrder += "first"
+    })
+    context2.addPostStatusUpdateListener(new PostStatusUpdateListener {
+      override def onStatusUpdateSent(context: TaskContext): Unit = callOrder += "second"
+    })
+    context2.invokePostStatusUpdateListeners()
+    assert(callOrder === Seq("second", "first"))
+
+    // Listener exception is wrapped in TaskCompletionListenerException
+    val context3 = TaskContext.empty()
+    context3.addPostStatusUpdateListener(new PostStatusUpdateListener {
+      override def onStatusUpdateSent(context: TaskContext): Unit =
+        throw new RuntimeException("post-status-update failure")
+    })
+    val e = intercept[TaskCompletionListenerException] {
+      context3.invokePostStatusUpdateListeners()
+    }
+    assert(e.getMessage.contains("post-status-update failure"))
+
+    // All listeners are called even if one throws (same behavior as completion listeners)
+    val context4 = TaskContext.empty()
+    val listener = mock(classOf[PostStatusUpdateListener])
+    context4.addPostStatusUpdateListener(new PostStatusUpdateListener {
+      override def onStatusUpdateSent(context: TaskContext): Unit =
+        throw new RuntimeException("bad listener")
+    })
+    context4.addPostStatusUpdateListener(listener)
+    context4.addPostStatusUpdateListener(new PostStatusUpdateListener {
+      override def onStatusUpdateSent(context: TaskContext): Unit =
+        throw new RuntimeException("another bad listener")
+    })
+
+    intercept[TaskCompletionListenerException] {
+      context4.invokePostStatusUpdateListeners()
+    }
+
+    verify(listener, times(1)).onStatusUpdateSent(any())
+
+    // invokePostStatusUpdateListeners is independent from TaskCompletionListener
+    // (completion listener should NOT be triggered by invokePostStatusUpdateListeners)
+    val context5 = TaskContext.empty()
+    var postStatusInvoked = false
+    var completionInvoked = false
+    context5.addPostStatusUpdateListener(new PostStatusUpdateListener {
+      override def onStatusUpdateSent(context: TaskContext): Unit = postStatusInvoked = true
+    })
+    context5.addTaskCompletionListener(new TaskCompletionListener {
+      override def onTaskCompletion(context: TaskContext): Unit = completionInvoked = true
+    })
+
+    context5.invokePostStatusUpdateListeners()
+    assert(postStatusInvoked)
+    assert(!completionInvoked) // completion listener should NOT be triggered
   }
 
   test("SPARK-46947: ensure the correct block manager is used to unroll memory for task") {

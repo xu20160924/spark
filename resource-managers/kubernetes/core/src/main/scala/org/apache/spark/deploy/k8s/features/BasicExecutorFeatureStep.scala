@@ -42,6 +42,8 @@ private[spark] class BasicExecutorFeatureStep(
 
   // Consider moving some of these fields to KubernetesConf or KubernetesExecutorSpecificConf
   private val executorContainerImage = kubernetesConf.image
+  private val allowPrivilegeEscalation =
+    kubernetesConf.get(KUBERNETES_EXECUTOR_ALLOW_PRIVILEGE_ESCALATION)
   private val blockManagerPort = kubernetesConf
     .sparkConf
     .getInt(BLOCK_MANAGER_PORT.key, DEFAULT_BLOCKMANAGER_PORT)
@@ -164,7 +166,13 @@ private[spark] class BasicExecutorFeatureStep(
       KubernetesUtils.buildEnvVars(
         Seq(
           ENV_DRIVER_URL -> driverUrl,
-          ENV_EXECUTOR_CORES -> execResources.cores.get.toString,
+          ENV_EXECUTOR_CORES -> {
+            if (kubernetesConf.get(KUBERNETES_ALLOCATION_RECOVERY_MODE_ENABLED).getOrElse(false)) {
+              kubernetesConf.get("spark.task.cpus", "1")
+            } else {
+              execResources.cores.get.toString
+            }
+          },
           ENV_EXECUTOR_MEMORY -> executorMemoryString,
           ENV_APPLICATION_ID -> kubernetesConf.appId,
           // This is to set the SPARK_CONF_DIR to be /opt/spark/conf
@@ -232,6 +240,9 @@ private[spark] class BasicExecutorFeatureStep(
       .addAllToEnv(executorEnv.asJava)
       .addAllToPorts(requiredPorts.asJava)
       .addToArgs("executor")
+      .editOrNewSecurityContext()
+        .withAllowPrivilegeEscalation(allowPrivilegeEscalation)
+        .endSecurityContext()
       .build()
     val executorContainerWithConfVolume = if (disableConfigMap) {
       executorContainer

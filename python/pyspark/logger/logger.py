@@ -1,4 +1,3 @@
-# -*- encoding: utf-8 -*-
 #
 # Licensed to the Apache Software Foundation (ASF) under one or more
 # contributor license agreements.  See the NOTICE file distributed with
@@ -318,7 +317,7 @@ def _test() -> None:
     import pyspark.logger.logger
 
     globs = pyspark.logger.logger.__dict__.copy()
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.logger.logger, globs=globs, optionflags=doctest.ELLIPSIS
     )
 

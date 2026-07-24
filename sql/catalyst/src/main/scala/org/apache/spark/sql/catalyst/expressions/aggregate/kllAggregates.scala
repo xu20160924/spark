@@ -54,6 +54,13 @@ import org.apache.spark.sql.types.{AbstractDataType, BinaryType, ByteType, DataT
       The optional k parameter controls the size and accuracy of the sketch (default 200, range 8-65535).
       Larger k values provide more accurate quantile estimates but result in larger, slower sketches.
   """,
+  arguments = """
+    Arguments:
+      * expr - The expression to aggregate into the KLL sketch.
+        An expression that evaluates to an integral.
+      * k - The parameter controlling the size and accuracy of the sketch.
+        An expression that evaluates to an integer. Must be a constant.
+  """,
   examples = """
     Examples:
       > SELECT LENGTH(kll_sketch_to_string_bigint(_FUNC_(col))) > 0 FROM VALUES (1), (2), (3), (4), (5) tab(col);
@@ -337,6 +344,13 @@ case class KllSketchAggFloat(
       The optional k parameter controls the size and accuracy of the sketch (default 200, range 8-65535).
       Larger k values provide more accurate quantile estimates but result in larger, slower sketches.
   """,
+  arguments = """
+    Arguments:
+      * expr - The expression to aggregate into the KLL sketch.
+        An expression that evaluates to a float or double.
+      * k - The parameter controlling the size and accuracy of the sketch.
+        An expression that evaluates to an integer. Must be a constant.
+  """,
   examples = """
     Examples:
       > SELECT LENGTH(kll_sketch_to_string_double(_FUNC_(col))) > 0 FROM VALUES (CAST(1.0 AS DOUBLE)), (CAST(2.0 AS DOUBLE)), (CAST(3.0 AS DOUBLE)), (CAST(4.0 AS DOUBLE)), (CAST(5.0 AS DOUBLE)) tab(col);
@@ -485,7 +499,7 @@ case class KllSketchAggDouble(
        6
   """,
   group = "agg_funcs",
-  since = "4.1.0")
+  since = "4.1.2")
 // scalastyle:on line.size.limit
 case class KllMergeAggBigint(
     child: Expression,
@@ -558,7 +572,7 @@ case class KllMergeAggBigint(
        6
   """,
   group = "agg_funcs",
-  since = "4.1.0")
+  since = "4.1.2")
 // scalastyle:on line.size.limit
 case class KllMergeAggFloat(
     child: Expression,
@@ -631,7 +645,7 @@ case class KllMergeAggFloat(
        6
   """,
   group = "agg_funcs",
-  since = "4.1.0")
+  since = "4.1.2")
 // scalastyle:on line.size.limit
 case class KllMergeAggDouble(
     child: Expression,

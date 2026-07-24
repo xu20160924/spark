@@ -27,6 +27,7 @@ import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules._
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.CalendarInterval
 
@@ -52,10 +53,13 @@ class FilterPushdownSuite extends PlanTest {
   val attrB = $"b".int
   val attrC = $"c".int
   val attrD = $"d".int
+  val attrE = $"e".string
 
   val testRelation = LocalRelation(attrA, attrB, attrC)
 
   val testRelation1 = LocalRelation(attrD)
+
+  val testStringRelation = LocalRelation(attrA, attrB, attrE)
 
   val simpleDisjunctivePredicate =
     ("x.a".attr > 3) && ("y.a".attr > 13) || ("x.a".attr > 1) && ("y.a".attr > 11)
@@ -152,7 +156,7 @@ class FilterPushdownSuite extends PlanTest {
   test("can't push without rewrite") {
     val originalQuery =
       testRelation
-        .select($"a" + $"b" as "e")
+        .select($"a" + $"b" as "e", $"a" - $"b" as "f")
         .where($"e" === 1)
         .analyze
 
@@ -160,8 +164,109 @@ class FilterPushdownSuite extends PlanTest {
     val correctAnswer =
       testRelation
         .where($"a" + $"b" === 1)
-        .select($"a" + $"b" as "e")
+        .select($"a" + $"b" as "e", $"a" - $"b" as "f")
         .analyze
+
+    comparePlans(optimized, correctAnswer)
+  }
+
+  test("SPARK-47672: Do double evaluation when configured") {
+    withSQLConf(SQLConf.AVOID_DOUBLE_FILTER_EVAL.key -> "false") {
+      val originalQuery = testStringRelation
+        .select($"a", $"e".rlike("magic") as "f", $"e".rlike("notmagic") as "j", $"b")
+        .where($"a" > 5 && $"f")
+        .analyze
+
+      val optimized = Optimize.execute(originalQuery)
+
+      val correctAnswer = testStringRelation
+        .where($"a" > 5 && $"e".rlike("magic"))
+        .select($"a", $"e".rlike("magic") as "f", $"e".rlike("notmagic") as "j", $"b")
+        .analyze
+
+      comparePlans(optimized, correctAnswer)
+    }
+  }
+
+  test("SPARK-47672: Make sure that we handle the case where everything is expensive") {
+    val originalQuery = testStringRelation
+      .select($"e".rlike("magic") as "f")
+      .where($"f")
+      .analyze
+
+    val optimized = Optimize.execute(originalQuery)
+
+    // Nothing changes when everything is expensive.
+    val correctAnswer = originalQuery
+
+    comparePlans(optimized, correctAnswer)
+  }
+
+  // Case 1: Multiple filters that don't reference any projection aliases - all should be pushed
+  test("SPARK-47672: Case 1 - multiple filters not referencing projection aliases") {
+    val originalQuery = testStringRelation
+      .select($"a" as "c", $"e".rlike("magic") as "f", $"b" as "d", $"a", $"b")
+      .where($"a" > 5 && $"b" < 10)
+      .analyze
+
+    val optimized = Optimize.execute(originalQuery)
+
+    // Both filters on c and d should be pushed down since they just reference
+    // simple aliases (c->a, d->b) which are inexpensive
+    val correctAnswer = testStringRelation
+      .where($"a" > 5 && $"b" < 10)
+      .select($"a" as "c", $"e".rlike("magic") as "f", $"b" as "d", $"a", $"b")
+      .analyze
+
+    comparePlans(optimized, correctAnswer)
+  }
+
+  // Case 2: Multiple filters with inexpensive references - all should be pushed
+  test("SPARK-47672: Case 2 - multiple filters with inexpensive alias references") {
+    val originalQuery = testStringRelation
+      .select($"a" + $"b" as "sum", $"a" - $"b" as "diff", $"e".rlike("magic") as "f")
+      .where($"sum" > 10 && $"diff" < 5)
+      .analyze
+
+    val optimized = Optimize.execute(originalQuery)
+
+    // Both sum and diff are inexpensive (arithmetic), so both filters should be pushed
+    val correctAnswer = testStringRelation
+      .where($"a" + $"b" > 10 && $"a" - $"b" < 5)
+      .select($"a" + $"b" as "sum", $"a" - $"b" as "diff", $"e".rlike("magic") as "f")
+      .analyze
+
+    comparePlans(optimized, correctAnswer)
+  }
+
+  // Case 3: Filter references expensive to compute references.
+  test("SPARK-47672: Avoid double evaluation with projections can't push past certain items") {
+    val originalQuery = testStringRelation
+      .select($"a", $"e".rlike("magic") as "f")
+      .where($"a" > 5 || $"f")
+      .analyze
+
+    val optimized = Optimize.execute(originalQuery)
+
+    comparePlans(optimized, originalQuery)
+  }
+
+  // Combined case 1, 2, and 3 filter pushdown
+  test("SPARK-47672: Case 1, 2, and 3 make sure we leave up and push down correctly.") {
+    val originalQuery = testStringRelation
+      .select($"a" + $"b" as "sum", $"a" - $"b" as "diff", $"e".rlike("magic") as "f")
+      .where($"sum" > 10 && $"diff" < 5 && $"f")
+      .analyze
+
+    val optimized = Optimize.execute(originalQuery)
+
+    // Both sum and diff are inexpensive (arithmetic), so both pushed
+    // rlike magic is expensive so not pushed.
+    val correctAnswer = testStringRelation
+      .where($"a" + $"b" > 10 && $"a" - $"b" < 5)
+      .select($"a" + $"b" as "sum", $"a" - $"b" as "diff", $"e".rlike("magic") as "f")
+      .where($"f")
+      .analyze
 
     comparePlans(optimized, correctAnswer)
   }
@@ -1538,5 +1643,51 @@ class FilterPushdownSuite extends PlanTest {
     val correctAnswer = x.where(IsNotNull(Sequence($"x.a", $"x.b", None)) && $"x.c" > 1)
       .analyze
     comparePlans(optimizedQueryWithoutStep, correctAnswer)
+  }
+
+  test("push down deterministic predicate through BinBy") {
+    // Relation: ts_start, ts_end, value (DISTRIBUTE), label (pass-through).
+    val tsStart = AttributeReference("ts_start", TimestampType, nullable = false)()
+    val tsEnd = AttributeReference("ts_end", TimestampType, nullable = false)()
+    val value = AttributeReference("value", DoubleType, nullable = false)()
+    val label = AttributeReference("label", StringType, nullable = true)()
+    val relation = LocalRelation(tsStart, tsEnd, value, label)
+
+    // Produced attributes: scaled DISTRIBUTE output and appended BIN BY columns.
+    val scaledValue = AttributeReference("value", DoubleType, nullable = true)()
+    val binStart = AttributeReference("bin_start", TimestampType, nullable = true)()
+    val binEnd = AttributeReference("bin_end", TimestampType, nullable = true)()
+    val binRatio = AttributeReference("bin_distribute_ratio", DoubleType, nullable = true)()
+
+    def binByOver(child: LogicalPlan): BinBy = BinBy(
+      binWidthMicros = 300000000L,
+      rangeStart = tsStart,
+      rangeEnd = tsEnd,
+      originMicros = 0L,
+      distributeColumns = Seq(value),
+      scaledDistributeColumns = Seq(scaledValue),
+      appendedAttributes = Seq(binStart, binEnd, binRatio),
+      child = child,
+      timeZoneId = Some("UTC"))
+
+    // (a) A predicate on a forwarded pass-through column (label) must push BELOW BinBy.
+    val queryA = Filter(EqualTo(label, Literal("x")), binByOver(relation))
+    val optimizedA = Optimize.execute(queryA)
+    val expectedA = binByOver(Filter(EqualTo(label, Literal("x")), relation))
+    comparePlans(optimizedA, expectedA, checkAnalysis = false)
+
+    // (b) A predicate on a range column (ts_start) must push BELOW BinBy. The range columns are
+    // consumed by the binning logic yet forwarded unchanged in output, so their value is identical
+    // on every sub-row and filtering before vs. after binning is equivalent.
+    val tsLiteral = Literal(0L, TimestampType)
+    val queryB = Filter(GreaterThan(tsStart, tsLiteral), binByOver(relation))
+    val optimizedB = Optimize.execute(queryB)
+    val expectedB = binByOver(Filter(GreaterThan(tsStart, tsLiteral), relation))
+    comparePlans(optimizedB, expectedB, checkAnalysis = false)
+
+    // (c) A predicate on a produced (fresh-ExprId) appended column must stay ABOVE BinBy.
+    val queryC = Filter(GreaterThan(binRatio, Literal(0.5)), binByOver(relation))
+    val optimizedC = Optimize.execute(queryC)
+    comparePlans(optimizedC, queryC, checkAnalysis = false)
   }
 }

@@ -38,14 +38,18 @@ class TimestampNTZType private () extends DatetimeType {
 
   override def typeName: String = "timestamp_ntz"
 
+  override def equals(obj: Any): Boolean = obj.isInstanceOf[TimestampNTZType]
+
+  override def hashCode(): Int = classOf[TimestampNTZType].getSimpleName.hashCode
+
   private[spark] override def asNullable: TimestampNTZType = this
 }
 
 /**
  * The companion case object and its class is separated so the companion object also subclasses
- * the TimestampNTZType class. Otherwise, the companion object would be of type "TimestampNTZType"
- * in byte code. Defined with a private constructor so the companion object is the only possible
- * instantiation.
+ * the TimestampNTZType class. Otherwise, the companion object would be of type
+ * "TimestampNTZType$" in byte code. Defined with a private constructor so the companion object is
+ * the only possible instantiation.
  *
  * @since 3.4.0
  */

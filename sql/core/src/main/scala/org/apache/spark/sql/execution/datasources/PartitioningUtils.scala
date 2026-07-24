@@ -308,10 +308,14 @@ object PartitioningUtils extends SQLConfHelper {
       None
     } else {
       val columnName = unescapePathName(columnSpec.take(equalSignIndex))
-      assert(columnName.nonEmpty, s"Empty partition column name in '$columnSpec'")
+      if (columnName.isEmpty) {
+        throw QueryExecutionErrors.emptyPartitionColumnNameError(columnSpec)
+      }
 
       val rawColumnValue = columnSpec.drop(equalSignIndex + 1)
-      assert(rawColumnValue.nonEmpty, s"Empty partition column value in '$columnSpec'")
+      if (rawColumnValue.isEmpty) {
+        throw QueryExecutionErrors.emptyPartitionColumnValueError(columnSpec)
+      }
 
       val dataType = if (userSpecifiedDataTypes.contains(columnName)) {
         // SPARK-26188: if user provides corresponding column schema, get the column value without
@@ -558,7 +562,7 @@ object PartitioningUtils extends SQLConfHelper {
       Cast(Literal(value), DateType, Some(zoneId.getId)).eval()
     case tt: TimeType => Cast(Literal(unescapePathName(value)), tt).eval()
     // Timestamp types
-    case dt if AnyTimestampType.acceptsType(dt) =>
+    case dt if AnyTimestampType.acceptsType(dt) || AnyTimestampNanoType.acceptsType(dt) =>
       Try {
         Cast(Literal(unescapePathName(value)), dt, Some(zoneId.getId)).eval()
       }.getOrElse {
@@ -644,11 +648,12 @@ object PartitioningUtils extends SQLConfHelper {
    * Given a collection of [[Literal]]s, resolves possible type conflicts by
    * [[findWiderTypeForPartitionColumn]].
    */
-  private def resolveTypeConflicts(typedValues: Seq[TypedPartValue]): Seq[TypedPartValue] = {
+  private def resolveTypeConflicts(typedValues: Seq[TypedPartValue]): IndexedSeq[TypedPartValue] = {
     val dataTypes = typedValues.map(_.dataType)
     val desiredType = dataTypes.reduce(findWiderTypeForPartitionColumn)
 
-    typedValues.map(tv => tv.copy(dataType = desiredType))
+    // IndexedSeq guarantees O(1) apply at the call site; a List would make the loop O(n^2).
+    typedValues.view.map(tv => tv.copy(dataType = desiredType)).toIndexedSeq
   }
 
   /**

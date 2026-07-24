@@ -28,7 +28,8 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql
 import org.apache.spark.sql.Encoders
 import org.apache.spark.sql.catalyst.DataSourceOptions
-import org.apache.spark.sql.catalyst.analysis.UnresolvedRelation
+import org.apache.spark.sql.catalyst.analysis.{RelationChanges, UnresolvedRelation}
+import org.apache.spark.sql.catalyst.analysis.ChangelogContextUtils
 import org.apache.spark.sql.catalyst.csv.{CSVHeaderChecker, CSVOptions, UnivocityParser}
 import org.apache.spark.sql.catalyst.expressions.ExprUtils
 import org.apache.spark.sql.catalyst.json.{CreateJacksonParser, JacksonParser, JSONOptions}
@@ -36,6 +37,7 @@ import org.apache.spark.sql.catalyst.plans.logical.UnresolvedDataSource
 import org.apache.spark.sql.catalyst.util.FailureSafeParser
 import org.apache.spark.sql.catalyst.xml.{StaxXmlParser, XmlOptions}
 import org.apache.spark.sql.classic.ClassicConversions._
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.datasources.csv._
 import org.apache.spark.sql.execution.datasources.jdbc.{JDBCOptions, JDBCPartition, JDBCRelation}
 import org.apache.spark.sql.execution.datasources.json.JsonUtils.checkJsonSchema
@@ -165,6 +167,12 @@ class DataFrameReader private[sql](sparkSession: SparkSession)
       sparkSession.sessionState.conf.sessionLocalTimeZone,
       sparkSession.sessionState.conf.columnNameOfCorruptRecord)
 
+    // Each element of the input dataset is already one JSON document, so the embedded array
+    // splitting can never apply.
+    if (parsedOptions.explodeEmbeddedArray.isDefined) {
+      throw QueryCompilationErrors.explodeEmbeddedArrayUnsupportedUsage(
+        "the json(Dataset[String]) API")
+    }
     userSpecifiedSchema.foreach(checkJsonSchema)
     val schema = userSpecifiedSchema.map {
       case s if !SQLConf.get.getConf(
@@ -314,10 +322,24 @@ class DataFrameReader private[sql](sparkSession: SparkSession)
   /** @inheritdoc */
   def table(tableName: String): DataFrame = {
     assertNoSpecifiedSchema("table")
+    val temporalIdent =
+      sparkSession.sessionState.sqlParser.parseTemporalTableIdentifier(tableName)
+    val relation = UnresolvedRelation(temporalIdent.nameParts,
+      new CaseInsensitiveStringMap(extraOptions.toMap.asJava))
+    Dataset.ofRows(sparkSession, temporalIdent.wrapTimeTravel(relation))
+  }
+
+  /** @inheritdoc */
+  def changes(tableName: String): DataFrame = {
+    require(tableName != null, "The table name can't be null")
+    assertNoSpecifiedSchema("changes")
     val multipartIdentifier =
       sparkSession.sessionState.sqlParser.parseMultipartIdentifier(tableName)
-    Dataset.ofRows(sparkSession, UnresolvedRelation(multipartIdentifier,
-      new CaseInsensitiveStringMap(extraOptions.toMap.asJava)))
+    val options = new CaseInsensitiveStringMap(extraOptions.toMap.asJava)
+    val changelogContext = ChangelogContextUtils.fromOptions(
+      options, sparkSession.sessionState.conf.sessionLocalTimeZone)
+    val relation = UnresolvedRelation(multipartIdentifier, options)
+    Dataset.ofRows(sparkSession, RelationChanges(relation, changelogContext))
   }
 
   /** @inheritdoc */
@@ -335,8 +357,10 @@ class DataFrameReader private[sql](sparkSession: SparkSession)
   override def textFile(paths: String*): Dataset[String] = super.textFile(paths: _*)
 
   /** @inheritdoc */
-  override protected def validateSingleVariantColumn(): Unit =
+  override protected def validateSingleVariantColumn(): Unit = {
     DataSourceOptions.validateSingleVariantColumn(extraOptions, userSpecifiedSchema)
+    DataSourceOptions.validateExplodeEmbeddedArray(extraOptions, userSpecifiedSchema)
+  }
 
   override protected def validateJsonSchema(): Unit =
     userSpecifiedSchema.foreach(checkJsonSchema)

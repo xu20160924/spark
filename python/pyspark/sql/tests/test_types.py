@@ -1,4 +1,3 @@
-# -*- encoding: utf-8 -*-
 #
 # Licensed to the Apache Software Foundation (ASF) under one or more
 # contributor license agreements.  See the NOTICE file distributed with
@@ -67,6 +66,7 @@ from pyspark.sql.types import (
     GeographyType,
     GeometryType,
     NullType,
+    UserDefinedType,
     VariantType,
     VariantVal,
     _create_row,
@@ -142,8 +142,12 @@ class TypesTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_LIST_OR_NONE_OR_STRUCT",
-            messageParameters={"arg_name": "schema", "arg_type": "int"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "list, None or StructType",
+                "arg_name": "schema",
+                "arg_type": "int",
+            },
         )
 
         df = self.spark.createDataFrame(rdd)
@@ -1055,6 +1059,16 @@ class TypesTestsMixin:
         self.assertEqual(_infer_type(p), PythonOnlyUDT())
         _make_type_verifier(PythonOnlyUDT())(PythonOnlyPoint(1.0, 2.0))
         self.assertRaises(ValueError, lambda: _make_type_verifier(PythonOnlyUDT())([1.0, 2.0]))
+
+    def test_udt_from_json_import_type_mismatch(self):
+        json = {
+            "type": "udt",
+            "pyClass": "random.random",
+            "serializedClass": "",
+            "sqlType": StringType().jsonValue(),
+        }
+        with self.assertRaises(PySparkTypeError):
+            UserDefinedType.fromJson(json)
 
     def test_simple_udt_in_df(self):
         schema = StructType().add("key", LongType()).add("val", PythonOnlyUDT())
@@ -2301,7 +2315,7 @@ class TypesTestsMixin:
         ]
         json_str = "{%s}" % ",".join(['"%s": %s' % (t[0], t[1]) for t in expected_values])
 
-        df = self.spark.createDataFrame([({"json": json_str})])
+        df = self.spark.createDataFrame([{"json": json_str}])
         row = df.select(
             F.parse_json(df.json).alias("v"),
             F.array([F.parse_json(F.lit('{"a": 1}'))]).alias("a"),
@@ -2500,7 +2514,7 @@ class TypesTestsMixin:
             ("short_str", '"abc"', "abc"),
         ]
         json_str = "{%s}" % ",".join(['"%s": %s' % (t[0], t[1]) for t in expected_values])
-        df = self.spark.createDataFrame([({"json": json_str})])
+        df = self.spark.createDataFrame([{"json": json_str}])
         df_variant = df.select(F.parse_json(df.json).alias("v"))
         pandas = df_variant.toPandas()
         test_record = json.loads(pandas["v"].iloc[0].toJson())
@@ -2809,11 +2823,9 @@ class TypesTestsMixin:
     def test_geospatial_result_encoding(self):
         point_wkb = "010100000000000000000031400000000000001c40"
         point_bytes = bytes.fromhex(point_wkb)
-        df = self.spark.sql(
-            f"""
+        df = self.spark.sql(f"""
             SELECT ST_GeomFromWKB(X'{point_wkb}') AS geom,
-            ST_GeogFromWKB(X'{point_wkb}') AS geog"""
-        )
+            ST_GeogFromWKB(X'{point_wkb}') AS geog""")
         GeospatialRow = Row("geom", "geog")
         self.assertEqual(
             df.collect(),

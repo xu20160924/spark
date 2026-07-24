@@ -32,6 +32,7 @@ import java.util.{HexFormat, Locale, Properties, Random, UUID}
 import java.util.concurrent._
 import java.util.concurrent.TimeUnit.NANOSECONDS
 import java.util.zip.{GZIPInputStream, ZipInputStream}
+import javax.management.ObjectName
 
 import scala.annotation.tailrec
 import scala.collection.Map
@@ -454,38 +455,13 @@ private[spark] object Utils
     } else if (lowerSrc.endsWith(".zip")) {
       // After issue HADOOP-18145, unzip could keep file permissions.
       FileUtil.unZip(source, dest)
-    } else if (lowerSrc.endsWith(".tar.gz") || lowerSrc.endsWith(".tgz")) {
+    } else if (
+      lowerSrc.endsWith(".tar.gz") || lowerSrc.endsWith(".tgz") || lowerSrc.endsWith(".tar")) {
       FileUtil.unTar(source, dest)
-    } else if (lowerSrc.endsWith(".tar")) {
-      // TODO(SPARK-38632): should keep file permissions. Java implementation doesn't.
-      unTarUsingJava(source, dest)
     } else {
       logWarning(log"Cannot unpack ${MDC(LogKeys.FILE_NAME, source)}, " +
         log"just copying it to ${MDC(FILE_NAME2, dest)}.")
       copyRecursive(source, dest)
-    }
-  }
-
-  /**
-   * The method below was copied from `FileUtil.unTar` but uses Java-based implementation
-   * to work around a security issue, see also SPARK-38631.
-   */
-  private def unTarUsingJava(source: File, dest: File): Unit = {
-    if (!Utils.createDirectory(dest) && !dest.isDirectory) {
-      throw new IOException(s"Mkdirs failed to create $dest")
-    } else {
-      try {
-        // Should not fail because all Hadoop 2.1+ (from HADOOP-9264)
-        // have 'unTarUsingJava'.
-        val mth = classOf[FileUtil].getDeclaredMethod(
-          "unTarUsingJava", classOf[File], classOf[File], classOf[Boolean])
-        mth.setAccessible(true)
-        mth.invoke(null, source, dest, java.lang.Boolean.FALSE)
-      } catch {
-        // Re-throw the original exception.
-        case e: java.lang.reflect.InvocationTargetException if e.getCause != null =>
-          throw e.getCause
-      }
     }
   }
 
@@ -516,8 +492,8 @@ private[spark] object Utils
       in: InputStream,
       destFile: File,
       fileOverwrite: Boolean): Unit = {
-    val tempFile = File.createTempFile("fetchFileTemp", null,
-      new File(destFile.getParentFile.getAbsolutePath))
+    val tempFile = Files.createTempFile(
+      new File(destFile.getParentFile.getAbsolutePath).toPath, "fetchFileTemp", null).toFile
     logInfo(log"Fetching ${MDC(LogKeys.URL, url)} to ${MDC(FILE_ABSOLUTE_PATH, tempFile)}")
 
     try {
@@ -1886,6 +1862,23 @@ private[spark] object Utils
   }
 
   /**
+   * Upload a file to a Hadoop-compatible filesystem.
+   */
+  def uploadFileToHadoopCompatibleFS(
+      src: Path,
+      dest: Path,
+      fs: FileSystem,
+      delSrc: Boolean = false,
+      overwrite: Boolean = true): Unit = {
+    try {
+      fs.copyFromLocalFile(delSrc, overwrite, src, dest)
+    } catch {
+      case e: IOException =>
+        throw new SparkException(s"Error uploading file ${src.getName}", e)
+    }
+  }
+
+  /**
    * Whether the underlying JVM prefer IPv6 addresses.
    */
   val preferIPv6 = "true".equals(System.getProperty("java.net.preferIPv6Addresses"))
@@ -2144,19 +2137,18 @@ private[spark] object Utils
 
   /** Return a heap dump. Used to capture dumps for the web UI */
   def getHeapHistogram(): Array[String] = {
-    val pid = String.valueOf(ProcessHandle.current().pid())
-    val jmap = System.getProperty("java.home") + "/bin/jmap"
-    val builder = new ProcessBuilder(jmap, "-histo:live", pid)
-    val p = builder.start()
-    val rows = ArrayBuffer.empty[String]
-    Utils.tryWithResource(new BufferedReader(new InputStreamReader(p.getInputStream()))) { r =>
-      var line = ""
-      while (line != null) {
-        if (line.nonEmpty) rows += line
-        line = r.readLine()
-      }
-    }
-    rows.toArray
+    // SPARK-55809: Use DiagnosticCommandMBean in-process instead of spawning jmap as
+    // a subprocess.
+    // JDK 25 (JDK-8354460) changed `jmap -histo` to use streaming output. When jmap is
+    // spawned as a subprocess, its stdout must be drained continuously; if the caller
+    // blocks on waitFor() without reading, the pipe buffer fills up and jmap hangs.
+    // DiagnosticCommandMBean runs gcClassHistogram in-process and coordinates with GC
+    // through internal JVM APIs, avoiding the subprocess pipe-buffer issue entirely.
+    val server = ManagementFactory.getPlatformMBeanServer
+    val on = new ObjectName("com.sun.management:type=DiagnosticCommand")
+    val result = server.invoke(on, "gcClassHistogram",
+      Array[AnyRef](Array[String]()), Array[String]("[Ljava.lang.String;"))
+    result.asInstanceOf[String].split("\n").filter(_.nonEmpty)
   }
 
   def getThreadDumpForThread(threadId: Long): Option[ThreadStackTrace] = {
@@ -3074,7 +3066,8 @@ private[spark] object Utils
   def checkOffHeapEnabled(sparkConf: ReadOnlySparkConf, offHeapSize: Long): Long = {
     if (sparkConf.get(MEMORY_OFFHEAP_ENABLED)) {
       require(offHeapSize > 0,
-        s"${MEMORY_OFFHEAP_SIZE.key} must be > 0 when ${MEMORY_OFFHEAP_ENABLED.key} == true")
+        s"${MEMORY_OFFHEAP_SIZE.key} must be at least 1MiB when " +
+          s"${MEMORY_OFFHEAP_ENABLED.key} == true")
       offHeapSize
     } else {
       0
@@ -3093,8 +3086,19 @@ private[spark] object Utils
    * addressing the directory here. Also, we rely on the caller side to address any exceptions.
    */
   def unzipFilesFromFile(fs: FileSystem, dfsZipFile: Path, localDir: File): Seq[File] = {
+    val files = unzipFilesFromInputStream(fs.open(dfsZipFile), localDir)
+    logDebug(log"Unzipped from ${MDC(PATH, dfsZipFile)}\n\t${MDC(PATHS, files.mkString("\n\t"))}")
+    files
+  }
+
+  /**
+   * Decompress a zip input stream into a local dir. File names are read from the zip entries.
+   * Note, we skip addressing the directory here. Also, we rely on the caller side to address
+   * any exceptions.
+   */
+  def unzipFilesFromInputStream(inputStream: InputStream, localDir: File): Seq[File] = {
     val files = new ArrayBuffer[File]()
-    val in = new ZipInputStream(fs.open(dfsZipFile))
+    val in = new ZipInputStream(inputStream)
     var out: OutputStream = null
     try {
       var entry = in.getNextEntry()
@@ -3111,7 +3115,6 @@ private[spark] object Utils
         entry = in.getNextEntry()
       }
       in.close() // so that any error in closing does not get ignored
-      logDebug(log"Unzipped from ${MDC(PATH, dfsZipFile)}\n\t${MDC(PATHS, files.mkString("\n\t"))}")
     } finally {
       // Close everything no matter what happened
       Utils.closeQuietly(in)
@@ -3192,19 +3195,25 @@ private[spark] object Utils
   lazy val isShenandoahGC: Boolean = checkUseGC("UseShenandoahGC")
 
   def checkUseGC(useGCObjectStr: String): Boolean = {
-    Try {
-      val clazz = Utils.classForName("com.sun.management.HotSpotDiagnosticMXBean")
-        .asInstanceOf[Class[_ <: PlatformManagedObject]]
-      val vmOptionClazz = Utils.classForName("com.sun.management.VMOption")
-      val hotSpotDiagnosticMXBean = ManagementFactory.getPlatformMXBean(clazz)
-      val vmOptionMethod = clazz.getMethod("getVMOption", classOf[String])
-      val valueMethod = vmOptionClazz.getMethod("getValue")
-
-      val useGCObject = vmOptionMethod.invoke(hotSpotDiagnosticMXBean, useGCObjectStr)
-      val useGC = valueMethod.invoke(useGCObject).asInstanceOf[String]
-      "true".equals(useGC)
-    }.getOrElse(false)
+    getVMOptionValue(useGCObjectStr).contains("true")
   }
+
+  /**
+   * Retrieves the value of a HotSpot VM option via the HotSpotDiagnosticMXBean.
+   * Returns Some with the option value string on success, or None if the option
+   * cannot be read (e.g. on non-HotSpot JVMs or when the option does not exist).
+   */
+  def getVMOptionValue(option: String): Option[String] = Try {
+    val clazz = Utils.classForName("com.sun.management.HotSpotDiagnosticMXBean")
+      .asInstanceOf[Class[_ <: PlatformManagedObject]]
+    val vmOptionClazz = Utils.classForName("com.sun.management.VMOption")
+    val hotSpotDiagnosticMXBean = ManagementFactory.getPlatformMXBean(clazz)
+    val vmOptionMethod = clazz.getMethod("getVMOption", classOf[String])
+    val valueMethod = vmOptionClazz.getMethod("getValue")
+
+    val useGCObject = vmOptionMethod.invoke(hotSpotDiagnosticMXBean, option)
+    valueMethod.invoke(useGCObject).asInstanceOf[String]
+  }.toOption
 
   /**
    * Return a string of printStackTrace result.
